@@ -11,7 +11,18 @@ Does ``nautilus`` scale well to high dimensions?
 Does ``nautilus`` use GPUs for neural networks?
 -----------------------------------------------
 
-No, ``nautilus`` uses CPUs for all computations. There are two primary motivations for this. First, one overarching philosophy is to make ``nautilus`` easy to use with few dependencies. Packages like ``pytorch`` or ``tensorflow`` that implement neural network calculations on GPUs are typically more challenging to install. Instead, ``nautilus`` depends on ``scikit-learn``, a widely-used and easy-to-install machine learning package. Second, ``nautilus`` uses fairly shallow networks and small training sizes. In these scenarios, unlike for very deep networks and large training sizes, the speed-up offered by GPUs may not be that large.
+The upstream backend uses scikit-learn and CPUs. This fork adds an optional
+JAX backend, selected with ``compute_backend="jax"``. It trains the ensemble in
+one compiled operation and scores candidate batches on the JAX device.
+``compute_backend="auto"`` selects JAX only when a GPU is visible and otherwise
+retains scikit-learn.
+
+The networks are shallow and the training sets are small, so compilation,
+dispatch, and CPU-to-device transfer can outweigh computation on some
+problems. The JAX path is intended for cases where a fast accelerator
+likelihood makes repeated neural bounds the overall bottleneck. It does not
+batch or move the user's likelihood, and NumPy/SciPy bound geometry remains on
+CPU.
 
 Is ``nautilus`` a likelihood emulator?
 --------------------------------------

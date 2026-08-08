@@ -41,7 +41,7 @@ class NautilusBound:
     def compute(cls, points, log_l, log_l_min, log_v_target,
                 enlarge_per_dim=1.1, n_points_min=None, split_threshold=100,
                 periodic=None, n_networks=4, neural_network_kwargs=None,
-                pool=None, rng=None):
+                pool=None, rng=None, compute_backend='numpy'):
         """Compute a union of multiple neural network-based bounds.
 
         Parameters
@@ -79,6 +79,9 @@ class NautilusBound:
             Pool used for parallel processing. Default is None.
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
+        compute_backend : {'numpy', 'jax'}, optional
+            Backend used to train and evaluate neural networks. Default is
+            'numpy'.
 
         Returns
         -------
@@ -115,7 +118,7 @@ class NautilusBound:
                 points[select], log_l[select], log_l_min,
                 enlarge_per_dim=enlarge_per_dim, n_networks=n_networks,
                 neural_network_kwargs=neural_network_kwargs, pool=pool,
-                rng=rng))
+                rng=rng, compute_backend=compute_backend))
 
         bound.outer_bound = Union.compute(
             points[log_l >= log_l_min], enlarge_per_dim=enlarge_per_dim,
@@ -288,8 +291,8 @@ class NautilusBound:
 
         """
         if self.neural_bounds[0].emulator is not None:
-            return len(self.neural_bounds) * len(
-                self.neural_bounds[0].emulator.neural_networks)
+            return len(self.neural_bounds) * self.neural_bounds[
+                0].emulator.n_networks
         else:
             return 0
 

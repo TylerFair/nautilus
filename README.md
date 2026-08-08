@@ -50,6 +50,37 @@ Additionally, nautilus is also on conda-forge. To install via ``conda`` use the 
 conda install -c conda-forge nautilus-sampler
 ```
 
+### Optional JAX neural backend
+
+This fork includes an opt-in JAX implementation of Nautilus's neural-network
+ensemble. It trains all ensemble members together and keeps their parameters
+on the JAX device for batched bound scoring. The sampler controller,
+ellipsoidal geometry, likelihood calls, and evidence calculation are unchanged.
+
+```shell
+pip install ".[jax,checkpointing]"
+```
+
+Select it explicitly, or use it only when a GPU is visible:
+
+```python
+sampler = Sampler(prior, likelihood, compute_backend="jax")
+sampler = Sampler(prior, likelihood, compute_backend="auto")
+```
+
+`auto` deliberately retains scikit-learn on CPU, where the small networks do
+not normally amortize accelerator compilation and dispatch overhead. JAX uses
+FP32 for neural fitting and scoring; Nautilus's geometry and evidence
+bookkeeping remain NumPy/SciPy precision. `sampler.diagnostics` reports the
+resolved backend, device, likelihood/bound counts, and cumulative timings.
+
+The JAX backend currently supports the default ReLU/Adam MLP and the commonly
+used `hidden_layer_sizes`, `alpha`, `learning_rate_init`, `max_iter`, `tol`,
+`n_iter_no_change`, and Adam coefficient options. It does not vectorize or
+batch the user's likelihood. A sampler multiprocessing pool is not supported
+for device-resident bounds; ``pool=(likelihood_pool, None)`` can still be used
+to parallelize likelihood calls only.
+
 ## Documentation
 
 You can find the documentation at [nautilus-sampler.readthedocs.io](https://nautilus-sampler.readthedocs.io).

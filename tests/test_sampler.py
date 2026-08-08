@@ -93,6 +93,47 @@ def test_sampler_errors_and_warnings():
     with pytest.raises(ValueError):
         sampler.posterior(return_blobs=True)
 
+    with pytest.raises(ValueError):
+        Sampler(prior, likelihood, 2, compute_backend='invalid')
+
+
+def test_jax_sampler_statistical_parity_and_diagnostics():
+    pytest.importorskip('jax')
+
+    def prior(x):
+        return x
+
+    def likelihood(x):
+        center = np.array([0.35, 0.65])
+        return -0.5 * np.sum(((x - center) / 0.12)**2)
+
+    samplers = []
+    for backend in ['numpy', 'jax']:
+        sampler = Sampler(
+            prior, likelihood, n_dim=2, n_live=100, n_networks=2,
+            n_update=100, n_like_new_bound=500, n_batch=100, seed=7,
+            compute_backend=backend,
+            neural_network_kwargs={
+                'max_iter': 300, 'n_iter_no_change': 15,
+            })
+        assert sampler.run(f_live=0.05, n_eff=500, n_like_max=3000)
+        assert np.isfinite(sampler.log_z)
+        assert sampler.diagnostics['compute_backend'] == backend
+        assert sampler.diagnostics['n_like'] == sampler.n_like
+        assert sampler.diagnostics['n_bounds'] == len(sampler.bounds)
+        assert sampler.diagnostics['timings']['neural_train'] > 0
+        samplers.append(sampler)
+
+    summaries = []
+    for sampler in samplers:
+        points, log_weights, _ = sampler.posterior()
+        weights = np.exp(log_weights - np.max(log_weights))
+        weights /= np.sum(weights)
+        summaries.append(np.average(points, axis=0, weights=weights))
+
+    assert abs(samplers[0].log_z - samplers[1].log_z) < 0.4
+    assert np.all(np.abs(summaries[0] - summaries[1]) < 0.04)
+
 
 @pytest.mark.parametrize("discard_exploration_start", [True, False])
 @pytest.mark.parametrize("discard_exploration_end", [True, False, 1])

@@ -48,6 +48,13 @@ class NeuralNetworkEmulator:
 
     """
 
+    backend = 'numpy'
+
+    @property
+    def n_networks(self):
+        """Number of members in the ensemble."""
+        return len(self.neural_networks)
+
     @classmethod
     def train(cls, x, y, n_networks=4, neural_network_kwargs=None, pool=None):
         """Initialize and train the likelihood neural network emulator.
@@ -127,6 +134,7 @@ class NeuralNetworkEmulator:
             HDF5 group to write to.
 
         """
+        group.attrs['compute_backend'] = self.backend
         group.attrs['n_networks'] = len(self.neural_networks)
 
         for i, network in enumerate(self.neural_networks):
@@ -187,3 +195,42 @@ class NeuralNetworkEmulator:
             emulator.neural_networks.append(network)
 
         return emulator
+
+
+def resolve_compute_backend(compute_backend):
+    """Resolve ``auto`` and validate a neural-network compute backend.
+
+    ``auto`` intentionally selects JAX only when a GPU is visible. This keeps
+    ordinary CPU Nautilus runs on the mature scikit-learn implementation while
+    allowing applications such as PLATON to opt into acceleration safely.
+    """
+    if compute_backend not in ['numpy', 'jax', 'auto']:
+        raise ValueError(
+            "'compute_backend' must be one of 'numpy', 'jax', or 'auto'.")
+    if compute_backend != 'auto':
+        if compute_backend == 'jax':
+            from .neural_jax import jax_device_info
+            jax_device_info()
+        return compute_backend
+    try:
+        from .neural_jax import jax_device_info
+        return 'jax' if jax_device_info()['platform'] == 'gpu' else 'numpy'
+    except ImportError:
+        return 'numpy'
+
+
+def neural_network_emulator_class(compute_backend):
+    """Return the emulator class for an already resolved backend."""
+    compute_backend = resolve_compute_backend(compute_backend)
+    if compute_backend == 'jax':
+        from .neural_jax import JaxNeuralNetworkEmulator
+        return JaxNeuralNetworkEmulator
+    return NeuralNetworkEmulator
+
+
+def read_neural_network_emulator(group):
+    """Read either a legacy scikit-learn or a JAX emulator checkpoint."""
+    compute_backend = group.attrs.get('compute_backend', 'numpy')
+    if isinstance(compute_backend, bytes):
+        compute_backend = compute_backend.decode()
+    return neural_network_emulator_class(compute_backend).read(group)

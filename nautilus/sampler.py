@@ -15,6 +15,7 @@ from scipy.special import logsumexp
 from threadpoolctl import threadpool_limits
 
 from .bounds import NautilusBound, UnitCube
+from .neural import resolve_compute_backend
 from .pool import NautilusPool, likelihood_worker
 
 
@@ -55,6 +56,8 @@ class Sampler:
     neural_network_kwargs : dict
         Keyword arguments passed to the constructor of
         `sklearn.neural_network.MLPRegressor`.
+    compute_backend : str
+        Resolved neural-network backend, either ``numpy`` or ``jax``.
     n_batch : int
         Number of likelihood evaluations that are performed at each step.
     vectorized : bool
@@ -126,7 +129,7 @@ class Sampler:
                  likelihood_kwargs=None, n_batch=None,
                  n_like_new_bound=None, vectorized=False, pass_dict=None,
                  pool=None, seed=None, blobs_dtype=None, filepath=None,
-                 resume=True):
+                 resume=True, compute_backend='numpy'):
         r"""Initialize the sampler.
 
         Parameters
@@ -225,6 +228,10 @@ class Sampler:
             If True, resume from previous run if `filepath` exists. If False,
             start from scratch and overwrite any previous file. Default is
             True.
+        compute_backend : {'numpy', 'jax', 'auto'}, optional
+            Backend used to train and evaluate the neural-network ensemble.
+            ``auto`` selects JAX only when a GPU is visible and otherwise uses
+            the NumPy/scikit-learn implementation. Default is ``numpy``.
 
         Raises
         ------
@@ -286,6 +293,8 @@ class Sampler:
         self.periodic = periodic
 
         self.n_networks = n_networks
+        requested_compute_backend = compute_backend
+        self.compute_backend = resolve_compute_backend(compute_backend)
 
         if neural_network_kwargs is None:
             neural_network_kwargs = {}
@@ -310,6 +319,12 @@ class Sampler:
 
         self.pool_l = pool[0]
         self.pool_s = pool[-1]
+        if self.compute_backend == 'jax' and self.pool_s is not None:
+            raise ValueError(
+                "The JAX backend does not support a sampler pool because "
+                "device-resident bounds cannot be distributed safely. Use "
+                "pool=(likelihood_pool, None) to parallelize only likelihood "
+                "calls.")
 
         if n_batch is None:
             s = 1 if self.pool_l is None else self.pool_l.size
@@ -339,12 +354,37 @@ class Sampler:
         self.shell_t = np.zeros(0, dtype=int)
         self.log_l_t = np.zeros(0)
         self.blobs_t = None
+        self.timings = {
+            'run': 0.0,
+            'bound_build': 0.0,
+            'neural_train': 0.0,
+            'neural_calibration': 0.0,
+            'bound_sample': 0.0,
+            'likelihood': 0.0,
+        }
 
         self.filepath = filepath
         if resume and filepath is not None and Path(filepath).exists():
             with h5py.File(filepath, 'r') as fstream:
 
                 group = fstream['sampler']
+
+                if 'compute_backend' in group.attrs:
+                    stored_backend = group.attrs['compute_backend']
+                    if isinstance(stored_backend, bytes):
+                        stored_backend = stored_backend.decode()
+                    if (requested_compute_backend != 'auto' and
+                            stored_backend != self.compute_backend):
+                        raise ValueError(
+                            "The checkpoint uses compute_backend="
+                            f"'{stored_backend}', but "
+                            f"'{self.compute_backend}' "
+                            "was requested.")
+                    self.compute_backend = stored_backend
+
+                for key in self.timings:
+                    if f'timing_{key}' in group.attrs:
+                        self.timings[key] = group.attrs[f'timing_{key}']
 
                 self.rng.bit_generator.state = dict(  # noqa: C408
                     bit_generator='PCG64',
@@ -513,7 +553,28 @@ class Sampler:
             else:
                 self.print_status('Stopped')
 
+        self.timings['run'] += time() - t_start
         return success
+
+    @property
+    def diagnostics(self):
+        """Return backend, device, count, and cumulative timing diagnostics."""
+        if self.compute_backend == 'jax':
+            from .neural_jax import jax_device_info
+            device = jax_device_info()
+        else:
+            device = {'backend': 'numpy', 'platform': 'cpu', 'device': 'CPU'}
+        timings = dict(self.timings)
+        timings['bound_non_neural'] = max(
+            0.0, timings['bound_build'] - timings['neural_train'] -
+            timings['neural_calibration'])
+        return {
+            'compute_backend': self.compute_backend,
+            'device': device,
+            'n_like': self.n_like,
+            'n_bounds': len(self.bounds),
+            'timings': timings,
+        }
 
     @property
     def discard_exploration(self):
@@ -792,6 +853,7 @@ class Sampler:
             raise ValueError("'shell_t' must be empty list if not sampling " +
                              "from the last bound/shell.")
 
+        timing_start = time()
         n_bound = 0
         n_sample = 0
         idx_t = np.zeros(0, dtype=int)
@@ -836,8 +898,10 @@ class Sampler:
         points = np.concatenate(points_all)
 
         if shell_t is None:
+            self.timings['bound_sample'] += time() - timing_start
             return points, n_bound
         else:
+            self.timings['bound_sample'] += time() - timing_start
             return points, n_bound, idx_t
 
     def evaluate_likelihood(self, points):
@@ -862,6 +926,7 @@ class Sampler:
             not return blobs.
 
         """
+        timing_start = time()
         # Transform points from the unit cube to the input arguments of the
         # likelihood function.
         if callable(self.prior):
@@ -915,6 +980,7 @@ class Sampler:
                 np.array(list(zip(*blobs)), dtype=self.blobs_dtype))
 
         self.n_like += len(log_l)
+        self.timings['likelihood'] += time() - timing_start
 
         return log_l, blobs
 
@@ -1007,6 +1073,7 @@ class Sampler:
             Whether a new bound has been added.
 
         """
+        timing_start = time()
         # If this is the first bound, use the UnitCube bound.
         if len(self.bounds) == 0:
             log_l_min = -np.inf
@@ -1039,8 +1106,15 @@ class Sampler:
                         periodic=self.periodic,
                         n_networks=self.n_networks,
                         neural_network_kwargs=self.neural_network_kwargs,
-                        pool=self.pool_s, rng=self.rng)
+                        pool=self.pool_s, rng=self.rng,
+                        compute_backend=self.compute_backend)
                     bound.sample(1000, return_points=False, pool=self.pool_s)
+
+                for neural_bound in bound.neural_bounds:
+                    self.timings['neural_train'] += neural_bound.timings[
+                        'neural_train']
+                    self.timings['neural_calibration'] += neural_bound.timings[
+                        'neural_calibration']
 
                 # Only accept a new bound if it's smaller.
                 if bound.log_v < self.bounds[-1].log_v:
@@ -1063,6 +1137,7 @@ class Sampler:
                     np.zeros(self.blobs[-1][:0].shape, dtype=self.blobs_dtype))
         else:
             self.shell_log_l_min[-1] = log_l_min
+            self.timings['bound_build'] += time() - timing_start
             return False
 
         # Check which points points from previous shells could be transferred
@@ -1099,6 +1174,7 @@ class Sampler:
             if self.blobs is not None:
                 self.blobs_t = np.concatenate(self.blobs_t)
 
+        self.timings['bound_build'] += time() - timing_start
         return True
 
     def add_samples(self, shell, verbose=False):
@@ -1305,6 +1381,10 @@ class Sampler:
                     'shell_end_exp', 'n_update_iter', 'n_like_iter']:
             group.attrs[key] = getattr(self, key)
 
+        group.attrs['compute_backend'] = self.compute_backend
+        for key, value in self.timings.items():
+            group.attrs[f'timing_{key}'] = value
+
         for key in self.neural_network_kwargs:
             group.attrs[f'neural_network_{key}'] =\
                 self.neural_network_kwargs[key]
@@ -1361,6 +1441,9 @@ class Sampler:
                     'shell_log_l_min', 'shell_log_l', 'shell_log_v',
                     'n_update_iter', 'n_like_iter']:
             group.attrs[key] = getattr(self, key)
+
+        for key, value in self.timings.items():
+            group.attrs[f'timing_{key}'] = value
 
         group[f'points_{shell}'].resize(self.points[shell].shape)
         group[f'points_{shell}'][...] = self.points[shell]

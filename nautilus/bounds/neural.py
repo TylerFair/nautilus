@@ -1,9 +1,11 @@
 """Module implementing multi-dimensional neural network-based bounds."""
 
+from time import perf_counter
+
 import numpy as np
 from scipy.stats import rankdata
 
-from ..neural import NeuralNetworkEmulator
+from ..neural import neural_network_emulator_class, read_neural_network_emulator
 from .basic import Ellipsoid
 
 
@@ -28,7 +30,7 @@ class NeuralBound:
     @classmethod
     def compute(cls, points, log_l, log_l_min, enlarge_per_dim=1.1,
                 n_networks=4, neural_network_kwargs=None, pool=None,
-                rng=None):
+                rng=None, compute_backend='numpy'):
         """Compute a neural network-based bound.
 
         Parameters
@@ -51,6 +53,9 @@ class NeuralBound:
             Pool used for parallel processing. Default is None.
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
+        compute_backend : {'numpy', 'jax'}, optional
+            Backend used to train and evaluate neural networks. Default is
+            'numpy'.
 
         Returns
         -------
@@ -60,14 +65,18 @@ class NeuralBound:
         """
         bound = cls()
         bound.n_dim = points.shape[1]
+        bound.timings = {'geometry': 0.0, 'neural_train': 0.0,
+                         'neural_calibration': 0.0}
 
         if rng is None:
             rng = np.random.default_rng()
 
         # Determine the outer bound.
+        start = perf_counter()
         bound.outer_bound = Ellipsoid.compute(
             points[log_l >= log_l_min], enlarge_per_dim=enlarge_per_dim,
             rng=rng)
+        bound.timings['geometry'] += perf_counter() - start
 
         if n_networks == 0:
             bound.emulator = None
@@ -89,13 +98,18 @@ class NeuralBound:
             1 + (rankdata(log_l[select]) - 0.5) / np.sum(select))
         score[~select] = 0.5 * (
             (rankdata(log_l[~select]) - 0.5) / np.sum(~select))
-        bound.emulator = NeuralNetworkEmulator.train(
+        start = perf_counter()
+        emulator_class = neural_network_emulator_class(compute_backend)
+        bound.emulator = emulator_class.train(
             points_t, score, n_networks=n_networks,
             neural_network_kwargs=neural_network_kwargs, pool=pool)
+        bound.timings['neural_train'] += perf_counter() - start
 
+        start = perf_counter()
         bound.score_predict_min = np.polyval(np.polyfit(
             score, bound.emulator.predict(points_t), 3),
             np.amin(score[select]))
+        bound.timings['neural_calibration'] += perf_counter() - start
 
         return bound
 
@@ -166,10 +180,12 @@ class NeuralBound:
             rng = np.random.default_rng()
 
         bound.n_dim = group.attrs['n_dim']
+        bound.timings = {'geometry': 0.0, 'neural_train': 0.0,
+                         'neural_calibration': 0.0}
         bound.score_predict_min = group.attrs['score_predict_min']
         bound.outer_bound = Ellipsoid.read(group['outer_bound'], rng=rng)
         if 'emulator' in group:
-            bound.emulator = NeuralNetworkEmulator.read(group['emulator'])
+            bound.emulator = read_neural_network_emulator(group['emulator'])
         else:
             bound.emulator = None
 

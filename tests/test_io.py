@@ -154,3 +154,38 @@ def test_sampler_io(blobs, n_like_max, discard_exploration, n_networks,
     assert sampler_write.log_z == sampler_read.log_z
 
     Path('test.hdf5').unlink()
+
+
+def test_jax_sampler_checkpoint_backend_and_diagnostics(tmp_path):
+    pytest.importorskip('jax')
+
+    def prior(x):
+        return x
+
+    def likelihood(x):
+        return -0.5 * np.sum(((x - 0.5) / 0.15)**2)
+
+    filepath = tmp_path / 'jax-sampler.hdf5'
+    sampler = Sampler(
+        prior, likelihood, n_dim=2, n_live=100, n_networks=1,
+        n_update=100, n_like_new_bound=400, seed=4,
+        compute_backend='jax', filepath=filepath, resume=False,
+        neural_network_kwargs={
+            'max_iter': 300, 'n_iter_no_change': 15,
+        })
+    sampler.run(f_live=0.2, n_eff=300, n_like_max=800)
+
+    restored = Sampler(
+        prior, likelihood, n_dim=2, n_live=100, n_networks=1,
+        compute_backend='auto', filepath=filepath, resume=True)
+    assert restored.compute_backend == 'jax'
+    assert restored.n_like == sampler.n_like
+    assert len(restored.bounds) == len(sampler.bounds)
+    assert restored.diagnostics['timings']['neural_train'] == pytest.approx(
+        sampler.diagnostics['timings']['neural_train'])
+    assert restored.log_z == sampler.log_z
+
+    with pytest.raises(ValueError, match='checkpoint uses'):
+        Sampler(
+            prior, likelihood, n_dim=2, n_live=100, n_networks=1,
+            compute_backend='numpy', filepath=filepath, resume=True)
