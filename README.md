@@ -57,12 +57,20 @@ conda install -c conda-forge nautilus-sampler
 `Sampler(..., backend="auto")` (the default) accelerates network prediction,
 large ensemble fits, ellipsoid fitting, and bound sampling when JAX sees a GPU.
 Without JAX or a visible GPU it uses NumPy/scikit-learn. Use `backend="numpy"`
-to force the stock implementation, or `backend="jax"` to require JAX (including
+to force NumPy/scikit-learn, or `backend="jax"` to require JAX (including
 on CPU). Training below 4096 rows and unsupported sklearn training options use
 scikit-learn. Existing HDF5 checkpoints work with either backend; device draws
 are reproducible from the saved NumPy RNG, with statistical rather than bitwise
 equivalence to stock. Geometry and prediction use local float64 contexts without
 changing the likelihood's JAX precision setting.
+
+Both backends retain the k-way split fallback and empty-bound guard. NumPy
+matches upstream bit-for-bit as long as neither fix fires; the split fallback
+consumes the bound's RNG. A missing-cluster correction (`bincount(minlength=2)`)
+also enforces the existing minimum cluster size when a two-way GMM assigns
+every point to one cluster. Ordinary two-cluster splits are unchanged.
+Only `Sampler` resolves `"auto"`; direct bound/emulator compute and read calls
+default to `"numpy"` and accept an explicit `"jax"`.
 
 Install JAX in your own virtual environment, e.g. `python -m pip install
 "jax[cuda12]"` for NVIDIA CUDA 12, or `python -m pip install jax` for CPU; consult

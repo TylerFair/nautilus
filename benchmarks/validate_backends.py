@@ -1,6 +1,7 @@
 """Reproducible toy parity runs; use PYTHONPATH for an unmodified stock tree."""
 import argparse
 import json
+import sys
 from pathlib import Path
 from time import perf_counter
 
@@ -9,6 +10,7 @@ from scipy.integrate import quad
 from scipy.special import erf, logsumexp, ndtr
 
 from nautilus import Sampler
+from nautilus.neural import NeuralNetworkEmulator
 
 
 def problem(name):
@@ -45,17 +47,29 @@ if __name__ == '__main__':
     parser.add_argument('--seeds', nargs='+', type=int, default=[0, 1, 2])
     parser.add_argument('--n-live', type=int, default=500)
     parser.add_argument('--n-eff', type=int, default=3000)
+    parser.add_argument('--cases', nargs='+', choices=['gaussian', 'bimodal', 'curved'],
+                        default=['gaussian', 'bimodal', 'curved'])
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    for name in ('gaussian', 'bimodal', 'curved'):
+    for name in args.cases:
         for seed in args.seeds:
             d, likelihood, truth = problem(name)
             start = perf_counter()
             options = {} if args.backend == 'stock' else {'backend': args.backend}
             sampler = Sampler(lambda x:x, likelihood, n_dim=d, n_live=args.n_live,
                               n_networks=2, seed=seed, **options)
-            sampler.run(f_live=.05, n_eff=args.n_eff, discard_exploration=True)
+            fits = []
+
+            def record_fit(frame, event, result):
+                if event == 'return' and frame.f_code is NeuralNetworkEmulator.train.__func__.__code__:
+                    fits.append((len(frame.f_locals['x']), bool(frame.f_locals.get('use_jax'))))
+
+            sys.setprofile(record_fit)
+            try:
+                sampler.run(f_live=.05, n_eff=args.n_eff, discard_exploration=True)
+            finally:
+                sys.setprofile(None)
             x, log_w, _ = sampler.posterior()
             w = np.exp(log_w)
             mean = w @ x
@@ -74,6 +88,7 @@ if __name__ == '__main__':
                           volume_sigma=float(np.sqrt(volume_variance)), mean=mean.tolist(),
                           std=std.tolist(), quantiles=quantiles, n_like=sampler.n_like,
                           n_eff=sampler.n_eff, seconds=perf_counter()-start)
+            result.update(jax_fits=sum(j for n, j in fits), fit_rows=[n for n, j in fits])
             stem = args.output / f'{name}-{args.backend}-{seed}'
             np.savez_compressed(str(stem)+'.npz', x=x, w=w)
             Path(str(stem)+'.json').write_text(json.dumps(result, indent=2)+'\n')
