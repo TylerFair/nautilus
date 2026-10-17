@@ -18,6 +18,8 @@ from .bounds import NautilusBound, UnitCube
 from .neural import resolve_backend
 from .pool import NautilusPool, likelihood_worker
 
+_F_LIVE_UNSET = object()
+
 
 class Sampler:
     """A dynamic sampler using importance nested sampling.
@@ -450,6 +452,7 @@ class Sampler:
 
         success = (self.explored and np.all(self.shell_n >= n_shell) and
                    self.n_eff >= n_eff)
+        f_live_current = self._estimate_f_live(f_live)
 
         while ((self.n_like < n_like_max) and (time() - t_start < timeout) and
                not success):
@@ -459,13 +462,14 @@ class Sampler:
                 if ((self.n_update_iter >= self.n_update or
                      self.n_like_iter >= self.n_like_new_bound) and
                         np.sum(self.shell_n) > self.n_live):
-                    self.add_bound(verbose=verbose)
+                    self.add_bound(verbose=verbose, f_live=f_live_current)
                     self.n_update_iter = 0
                     self.n_like_iter = 0
                     if self.filepath is not None:
                         self.write(self.filepath, overwrite=True)
 
-                self.n_update_iter += self.add_samples(-1, verbose=verbose)
+                self.n_update_iter += self.add_samples(
+                    -1, verbose=verbose, f_live=f_live_current)
                 self.n_like_iter += self.n_batch
                 if self.filepath is not None:
                     # Write the complete file if this is the first batch.
@@ -473,7 +477,8 @@ class Sampler:
                         self.write(self.filepath, overwrite=True)
                     self.write_shell_update(self.filepath, -1)
 
-                if self.f_live <= f_live:
+                f_live_current = self._estimate_f_live(f_live)
+                if f_live_current <= f_live:
 
                     # If some shells are unoccupied in the end, remove them.
                     # They will contain close to 0 volume and may never yield a
@@ -502,7 +507,7 @@ class Sampler:
 
             elif np.any(self.shell_n < n_shell):
                 shell = np.flatnonzero(self.shell_n < n_shell)[0]
-                self.add_samples(shell, verbose=verbose)
+                self.add_samples(shell, verbose=verbose, f_live=None)
                 if self.filepath is not None:
                     self.write_shell_update(self.filepath, shell)
 
@@ -510,7 +515,7 @@ class Sampler:
                 shell = np.argmax(self.shell_log_l + self.shell_log_v -
                                   0.5 * np.log(self.shell_n) -
                                   0.5 * np.log(self.shell_n_eff))
-                self.add_samples(shell, verbose=verbose)
+                self.add_samples(shell, verbose=verbose, f_live=None)
                 if self.filepath is not None:
                     self.write_shell_update(self.filepath, shell)
 
@@ -519,9 +524,9 @@ class Sampler:
 
         if verbose:
             if success:
-                self.print_status('Finished')
+                self.print_status('Finished', f_live=None if self.explored else f_live_current)
             else:
-                self.print_status('Stopped')
+                self.print_status('Stopped', f_live=None if self.explored else f_live_current)
 
         return success
 
@@ -963,7 +968,7 @@ class Sampler:
             self.shell_log_l[index] = np.nan
             self.shell_n_eff[index] = 0
 
-    def print_status(self, status='', header=False, end='\n'):
+    def print_status(self, status='', header=False, end='\n', f_live=_F_LIVE_UNSET):
         """Print current summary statistics.
 
         Parameters
@@ -974,6 +979,8 @@ class Sampler:
             If True, print a static header. Default is False.
         end : str, optional
             String printed at the end. Default is newline.
+        f_live : float or None, optional
+            Previously computed live fraction. If omitted, compute it exactly.
 
         """
         if header:
@@ -985,7 +992,8 @@ class Sampler:
                 data.extend([self.bounds[-1].n_ell, self.bounds[-1].n_net])
             else:
                 data.extend([0, 0])
-            data.extend([self.n_like, self.f_live, self.n_eff, self.log_z])
+            data.extend([self.n_like, self.f_live if f_live is _F_LIVE_UNSET else f_live,
+                         self.n_eff, self.log_z])
 
             fmt = ['{}', '{:d}', '{:d}', '{:d}', '{:d}', '{:.4f}', '{:.0f}',
                    '{:+.2f}']
@@ -1000,7 +1008,7 @@ class Sampler:
         output = output.ljust(width)[:width]
         print(output, end=end, flush=True)
 
-    def add_bound(self, verbose=False):
+    def add_bound(self, verbose=False, f_live=_F_LIVE_UNSET):
         """Try building a new bound from existing points.
 
         If the new bound would be larger than the previous bound, reject the
@@ -1024,7 +1032,7 @@ class Sampler:
             success = True
         else:
             if verbose:
-                self.print_status('Bounding', end='\r')
+                self.print_status('Bounding', end='\r', f_live=f_live)
             log_l = np.concatenate(self.log_l)
             points = np.concatenate(self.points)[np.argsort(log_l)]
             log_l = np.sort(log_l)
@@ -1112,7 +1120,7 @@ class Sampler:
 
         return True
 
-    def add_samples(self, shell, verbose=False):
+    def add_samples(self, shell, verbose=False, f_live=_F_LIVE_UNSET):
         """Add samples to a shell.
 
         The number of new points added is always equal to the batch size.
@@ -1132,13 +1140,13 @@ class Sampler:
 
         """
         if verbose:
-            self.print_status('Sampling', end='\r')
+            self.print_status('Sampling', end='\r', f_live=f_live)
 
         if shell == -1 and len(self.shell_t) > 0:
             points, n_bound, idx_t = self.sample_shell(-1, self.shell_t)
             assert len(points) + len(idx_t) == n_bound
             if verbose:
-                self.print_status('Computing', end='\r')
+                self.print_status('Computing', end='\r', f_live=f_live)
             if len(idx_t) > 0:
                 self.points[-1] = np.concatenate((
                     self.points[-1], self.points_t[idx_t]))
@@ -1150,7 +1158,7 @@ class Sampler:
         else:
             points, n_bound = self.sample_shell(shell)
             if verbose:
-                self.print_status('Computing', end='\r')
+                self.print_status('Computing', end='\r', f_live=f_live)
 
         self.shell_n_sample[shell] += n_bound
         log_l, blobs = self.evaluate_likelihood(points)
@@ -1164,6 +1172,52 @@ class Sampler:
         self.update_shell_info(shell)
 
         return np.sum(log_l >= self.shell_log_l_min[shell])
+
+    def _estimate_f_live(self, threshold=0):
+        """Update changed shells only; confirm potential exploration stops."""
+        if self.explored:
+            return None
+        if np.sum(self.shell_n) == 0:
+            return 1.0
+        if self.n_live <= 0 or len(self.log_l) != len(self.shell_n) or any(
+                len(a) != n for a, n in zip(self.log_l, self.shell_n)):
+            return self.f_live
+        old_n_live, old = getattr(self, '_f_live_shell_cache', (None, {}))
+        if old_n_live != self.n_live:
+            old = {}
+        cache, sums, tops, offsets = {}, [], [], []
+        log_c = self.shell_log_v - np.log(np.maximum(self.shell_n, 1))
+        for a, n, offset in zip(self.log_l, self.shell_n, log_c):
+            if n == 0:
+                continue
+            hit = old.get(id(a))
+            if hit is None or hit[0] is not a:
+                top = a if len(a) <= self.n_live else a[np.argpartition(
+                    a, len(a) - self.n_live)[-self.n_live:]]
+                hit = a, logsumexp(a), np.sort(top)
+            cache[id(a)] = hit
+            sums.append(offset + hit[1])
+            tops.append(hit[2])
+            offsets.append(np.full(len(hit[2]), offset))
+        self._f_live_shell_cache = self.n_live, cache
+        values, offsets = np.concatenate(tops), np.concatenate(offsets)
+        live = (np.argpartition(values, len(values) - self.n_live)[-self.n_live:]
+                if len(values) > self.n_live else np.arange(len(values)))
+        total = logsumexp(sums)
+        log_w = values[live] + offsets[live]
+        estimate = np.exp(logsumexp(log_w) - total)
+        lower = estimate
+        if len(values) > self.n_live:
+            boundary = np.min(values[live])
+            tied = values[live] == boundary
+            # Apart from reduction roundoff, only boundary ties change the live
+            # set. Their shell weights can differ arbitrarily: bound them below
+            # so even a fast estimate far above the threshold cannot hide a stop.
+            lower = np.exp(logsumexp(np.append(log_w[~tied], boundary +
+                np.min(offsets[values == boundary]) + np.log(np.sum(tied)))) - total)
+        if not np.isfinite(estimate) or min(estimate, lower) <= 2 * threshold:
+            return self.f_live
+        return estimate
 
     @property
     def f_live(self):

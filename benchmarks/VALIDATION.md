@@ -93,8 +93,8 @@ on the shared login node. These are smoke timings, not isolated speed claims.
 The benchmark defaults remain 30-D, 5000 live points, 16 networks, and 10000
 epochs for the GPU orchestrator. CPU results support retaining the stock default.
 
-The production implementation adds 480 net lines in existing modules/config.
-Tests and benchmark scripts add 373 lines; documentation accounts for the
+The initial port added 480 net lines in existing modules/config.
+Its tests and benchmark scripts added 373 lines; documentation accounts for the
 remaining diff beyond the approximate 800-line budget. There are no production
 monkeypatches, sidecar formats, or duplicate stock methods.
 
@@ -106,3 +106,30 @@ Atomic full writes and prefix-checked incremental shell writes are deferred.
 The trainer uses sklearn's private initialization API, tested here on 1.7.2.
 Ruff was unavailable; an isolated `/tmp` install failed because network DNS
 was unavailable. Syntax checks and `git diff --check` passed.
+
+The f_live addendum compares the incremental path against the exact-memo path
+from `f141cb5`. Six toy/seed combinations per backend (Gaussian, FP32, and
+heavily tied plateaus; seeds 0 and 5) have identical stopping iterations,
+posterior arrays, lnZ, and RNG states. A separate adversarial tie case has a
+fast estimate of 0.25 versus an exact value around 7e-14: confirmation also uses
+a conservative lower bound on tied weights, so a factor-two miss cannot delay
+the exact stop. The public `f_live` property and checkpoint writers are unchanged.
+The run loop computes one estimate per batch and passes it to status output.
+
+Full suite reruns: **217 passed** on NumPy (488.75 s) and JAX CPU (489.51 s).
+There were 16/28 polynomial-conditioning warnings respectively. The optional
+Dask pool module remains excluded as directed; all other pool cases passed.
+
+`python benchmarks/benchmark_f_live.py` reports median milliseconds over three
+changed batches, with 32 shells, `n_live=5000`, and an initially 8192-point active
+shell. Fast timings measure the incremental path outside exact confirmation.
+
+| Synthetic points | Cold cache, fast | Changed batch, fast | Exact | Speedup |
+|---|---:|---:|---:|---:|
+| 1M | 30.250 | 2.932 | 65.824 | 22.5x |
+| 4M | 73.348 | 2.869 | 332.749 | 116.0x |
+| 8M | 127.022 | 2.775 | 851.317 | 306.7x |
+
+Warm cost scales with changed-shell size plus `n_shells * n_live`, independently
+of frozen-shell point counts. Near the stopping threshold, exact sorting remains
+intentional; the first call after resume must populate the shell cache.
