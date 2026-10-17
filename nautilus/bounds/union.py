@@ -394,11 +394,11 @@ class Union:
                     self.log_v_all - logsumexp(self.log_v_all), mask, c, b, inverse, n_ell))
         return self._parameters
 
-    def _jax_sample(self):
+    def _jax_sample(self, rng=None):
         """Draw one device block, seeding solely from this bound's saved RNG."""
         import jax
         from jax.experimental import enable_x64
-        a, b = self.rng.integers(2**32, size=2)
+        a, b = (self.rng if rng is None else rng).integers(2**32, size=2)
         with enable_x64():
             key = jax.random.fold_in(jax.random.PRNGKey(int(a)), int(b))
             points, keep = _jax_union(self.cube is not None)[1](self._jax_parameters(), key)

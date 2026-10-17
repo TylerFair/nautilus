@@ -231,7 +231,7 @@ class NautilusBound:
             if pool is None:
                 while len(self.points) < n_points:
                     if self.backend == 'jax':
-                        points, keep = self.outer_bound._jax_sample()
+                        points, keep = self.outer_bound._jax_sample(rng=self.rng)
                         self.outer_bound.n_sample += len(points)
                         self.outer_bound.n_reject += len(points) - np.sum(keep)
                         n_sample = int(np.sum(keep))

@@ -176,7 +176,7 @@ def invert_symmetric_positive_semidefinite_matrix(m):
     return m_inv_triangle + m_inv_triangle.T - np.diag(np.diag(m_inv_triangle))
 
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=64)
 def _jax_mvee(n_dim, n_max, n_batch):
     import jax
     import jax.numpy as jnp
