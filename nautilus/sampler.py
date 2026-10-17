@@ -15,6 +15,7 @@ from scipy.special import logsumexp
 from threadpoolctl import threadpool_limits
 
 from .bounds import NautilusBound, UnitCube
+from .neural import resolve_backend
 from .pool import NautilusPool, likelihood_worker
 
 
@@ -126,7 +127,7 @@ class Sampler:
                  likelihood_kwargs=None, n_batch=None,
                  n_like_new_bound=None, vectorized=False, pass_dict=None,
                  pool=None, seed=None, blobs_dtype=None, filepath=None,
-                 resume=True):
+                 resume=True, backend='auto'):
         r"""Initialize the sampler.
 
         Parameters
@@ -225,6 +226,11 @@ class Sampler:
             If True, resume from previous run if `filepath` exists. If False,
             start from scratch and overwrite any previous file. Default is
             True.
+        backend : {'auto', 'jax', 'numpy'}, optional
+            'auto' uses JAX when a GPU is visible, otherwise NumPy/sklearn.
+            'jax' requires JAX and can run on CPU; 'numpy' forces stock code.
+            Pooled runs always use NumPy. Never fork after initializing JAX;
+            use a fresh process or spawn pools. Default is 'auto'.
 
         Raises
         ------
@@ -298,6 +304,10 @@ class Sampler:
             pool = list(pool)
         except TypeError:
             pool = [pool]
+
+        # Resolve before constructing any pool; pooled runs never initialize JAX.
+        self.backend = resolve_backend(backend, None if all(
+            p is None or p == 1 for p in pool) else pool)
 
         for i in range(len(pool)):
             if pool[i] in [None, 1]:
@@ -379,7 +389,7 @@ class Sampler:
                     UnitCube.read(fstream['bound_0'], rng=self.rng), ]
                 for i in range(1, len(self.shell_n)):
                     self.bounds.append(NautilusBound.read(
-                        fstream[f'bound_{i}'], rng=self.rng))
+                        fstream[f'bound_{i}'], rng=self.rng, backend=self.backend))
 
     def run(self, f_live=0.01, n_shell=1, n_eff=10000, n_like_max=np.inf,
             discard_exploration=False, timeout=np.inf, verbose=False):
@@ -1039,8 +1049,9 @@ class Sampler:
                         periodic=self.periodic,
                         n_networks=self.n_networks,
                         neural_network_kwargs=self.neural_network_kwargs,
-                        pool=self.pool_s, rng=self.rng)
-                    bound.sample(1000, return_points=False, pool=self.pool_s)
+                        pool=self.pool_s, rng=self.rng, backend=self.backend)
+                    bound.sample(1000, return_points=False, pool=self.pool_s,
+                                 _max_draws=5_000_000)
 
                 # Only accept a new bound if it's smaller.
                 if bound.log_v < self.bounds[-1].log_v:
@@ -1171,13 +1182,21 @@ class Sampler:
         elif np.sum(self.shell_n) == 0:
             return 1.0
         else:
+            # Stored likelihood arrays are replaced, never modified in place.
+            key = (self.n_like, self.n_live,
+                   tuple((id(a), len(a)) for a in self.log_l),
+                   self.shell_n.tobytes(), self.shell_log_v.tobytes())
+            if getattr(self, '_f_live_key', None) == key:
+                return self._f_live_value
             log_v = np.repeat(
                 self.shell_log_v - np.log(np.maximum(self.shell_n, 1)),
                 self.shell_n)
             log_l = np.concatenate(self.log_l)
             log_w = log_v + log_l
-            log_w_live = log_w[np.argsort(log_l)][-self.n_live:]
-            return np.exp(logsumexp(log_w_live) - logsumexp(log_w))
+            log_w_live = log_w[np.argsort(log_l)[-self.n_live:]]
+            self._f_live_key = key
+            self._f_live_value = np.exp(logsumexp(log_w_live) - logsumexp(log_w))
+            return self._f_live_value
 
     @property
     def log_v_live(self):

@@ -1,6 +1,7 @@
 """Module implementing unions of basic bounds."""
 
 import itertools
+from functools import lru_cache
 
 import numpy as np
 from scipy.optimize import minimize
@@ -8,7 +9,46 @@ from scipy.special import logsumexp
 from scipy.stats import multivariate_normal
 from sklearn.mixture import GaussianMixture
 
+from ..neural import _jax_call, resolve_backend
 from .basic import Ellipsoid, UnitCube, UnitCubeEllipsoidMixture
+
+
+@lru_cache(maxsize=2)
+def _jax_union(use_cube):
+    import jax
+    import jax.numpy as jnp
+
+    def membership(parameters, x):
+        _, mask, c, _, inverse, n_ell = parameters
+        t = jnp.einsum('kij,knj->kni', inverse, x[None] - c[:, None])
+        member = ((jnp.sum(t**2, axis=-1) < 1) | (n_ell[:, None] == 0)) & jnp.all(
+            ((x >= 0) & (x < 1))[None] | ~mask[:, None], axis=-1)
+        inside = jnp.all((x >= 0) & (x < 1), axis=-1) if use_cube else True
+        return member, inside
+
+    @jax.jit
+    def contains(parameters, x):
+        member, inside = membership(parameters, x)
+        return jnp.any(member, axis=0) & inside
+
+    @jax.jit
+    def sample(parameters, key):
+        log_p, mask, c, b, _, n_ell = parameters
+        keys = jax.random.split(key, 5)
+        component = jax.random.categorical(keys[0], log_p, shape=(16384,))
+        cube = mask[component]
+        z = jnp.where(cube, 0., jax.random.normal(keys[1], cube.shape, dtype=jnp.float64))
+        radius = jnp.sqrt(jnp.sum(z**2, axis=1, keepdims=True))
+        z = z / jnp.where(radius > 0, radius, 1) * jax.random.uniform(
+            keys[2], (16384, 1), dtype=jnp.float64)**(1 / jnp.maximum(n_ell[component, None], 1))
+        x = jnp.where(cube, jax.random.uniform(keys[3], cube.shape, dtype=jnp.float64),
+                      jnp.einsum('nij,nj->ni', b[component], z) + c[component])
+        member, inside = membership(parameters, x)
+        keep = inside & (jax.random.uniform(keys[4], (16384,), dtype=jnp.float64) *
+                         jnp.maximum(jnp.sum(member, axis=0), 1) < 1)
+        return x, keep
+
+    return contains, sample
 
 
 def ellipsoids_overlap(ellipsoids):
@@ -79,7 +119,7 @@ class Union:
 
     @classmethod
     def compute(cls, points, enlarge_per_dim=1.1, n_points_min=None,
-                unit=True, bound_class=Ellipsoid, rng=None):
+                unit=True, bound_class=Ellipsoid, rng=None, backend='auto'):
         """Compute the bound.
 
         Upon creation, the bound consists of a single individual bound.
@@ -117,6 +157,7 @@ class Union:
 
         """
         bound = cls()
+        bound.backend = resolve_backend(backend)
         bound.n_dim = points.shape[1]
         bound.enlarge_per_dim = enlarge_per_dim
 
@@ -137,7 +178,7 @@ class Union:
         bound.points_bounds = [points]
         bound.bounds = [bound_class.compute(
             points, enlarge_per_dim=enlarge_per_dim,
-            rng=rng)]
+            rng=rng, backend=bound.backend)]
         bound.log_v_all = np.array([bound.bounds[0].log_v])
         bound.block = np.atleast_1d(len(points) < 2 * bound.n_points_min)
 
@@ -179,6 +220,8 @@ class Union:
                              "bounds are ellipsoids.")
 
         if not np.any(~self.block):
+            if allow_overlap and isinstance(self.bounds[0], UnitCubeEllipsoidMixture):
+                return self._split_kway()
             return False
 
         index = np.argmax(np.where(~self.block, self.log_v_all, -np.inf))
@@ -194,8 +237,8 @@ class Union:
         labels = np.argmax(p, axis=1)
         # If one of the clusters has less than n_points_min members, re-assign
         # the most likely members from the larger cluster to the smaller one.
-        if not np.all(np.bincount(labels) >= self.n_points_min):
-            label = np.argmin(np.bincount(labels))
+        if not np.all(np.bincount(labels, minlength=2) >= self.n_points_min):
+            label = np.argmin(np.bincount(labels, minlength=2))
             labels[np.argsort(-p[:, label])[:self.n_points_min]] = label
 
         new_bounds = []
@@ -203,7 +246,7 @@ class Union:
         for label in [0, 1]:
             new_bounds.append(type(self.bounds[0]).compute(
                 points[labels == label], enlarge_per_dim=self.enlarge_per_dim,
-                rng=self.rng))
+                rng=self.rng, backend=self.backend))
 
         if not allow_overlap and ellipsoids_overlap(
                 self.bounds[:index] + self.bounds[index + 1:] + new_bounds):
@@ -214,16 +257,52 @@ class Union:
             self.block[index] = True
             return self.split(allow_overlap=allow_overlap)
 
+        return self._replace(index, [points[labels == i] for i in range(2)], new_bounds)
+
+    def _split_kway(self):
+        """Try k=3..6 only after the outer union's binary splits fail."""
+        for index in np.argsort(-self.log_v_all):
+            component, points = self.bounds[index], self.points_bounds[index]
+            if getattr(component, '_kway_tried', False) or len(points) < 3 * self.n_points_min:
+                continue
+            component._kway_tried = True
+            z = component.transform(points)
+            best = None
+            for k in range(3, min(6, len(points) // self.n_points_min) + 1):
+                gmm = GaussianMixture(n_components=k, n_init=4,
+                                      random_state=self.rng.integers(2**32 - 1)).fit(z)
+                p = np.column_stack([multivariate_normal.logpdf(
+                    z, mean=gmm.means_[i], cov=gmm.covariances_[i], allow_singular=True) +
+                    np.log(gmm.weights_[i]) for i in range(k)])
+                alive = np.ones(k, bool)
+                while True:
+                    labels = np.argmax(np.where(alive, p, -np.inf), axis=1)
+                    counts = np.bincount(labels, minlength=k)
+                    small = alive & (counts < self.n_points_min)
+                    if not np.any(small) or np.sum(alive) == 1:
+                        break
+                    alive[np.argmin(np.where(small, counts, np.inf))] = False
+                groups = [points[labels == i] for i in np.unique(labels)]
+                if len(groups) < 2:
+                    continue
+                children = [type(component).compute(g, enlarge_per_dim=self.enlarge_per_dim,
+                            rng=self.rng, backend=self.backend) for g in groups]
+                volume = logsumexp([b.log_v for b in children])
+                if volume < component.log_v and (best is None or volume < best[0]):
+                    best = volume, groups, children
+            if best is not None:
+                return self._replace(index, best[1], best[2])
+        return False
+
+    def _replace(self, index, groups, new_bounds):
         self.points_bounds.pop(index)
-        self.points_bounds.append(points[labels == 0])
-        self.points_bounds.append(points[labels == 1])
+        self.points_bounds.extend(groups)
         self.bounds.pop(index)
         self.bounds = self.bounds + new_bounds
         self.log_v_all = np.array([bound.log_v for bound in self.bounds])
         self.block = np.concatenate(
             (np.delete(self.block, index),
-             [len(self.points_bounds[-2]) < 2 * self.n_points_min,
-              len(self.points_bounds[-1]) < 2 * self.n_points_min]))
+             [len(g) < 2 * self.n_points_min for g in groups]))
 
         # Reset the sampling.
         self.reset()
@@ -284,11 +363,46 @@ class Union:
             contained in the bound.
 
         """
+        if self.backend == 'jax':
+            return _jax_call(_jax_union(self.cube is not None)[0], self._jax_parameters(), points)
         in_bound = np.any([bound.contains(points) for bound in self.bounds],
                           axis=0)
         if self.cube is not None:
             in_bound = in_bound & self.cube.contains(points)
         return in_bound
+
+    def _jax_parameters(self):
+        """Embed cube/ellipsoid mixtures in the full coordinate space."""
+        if not hasattr(self, '_parameters'):
+            import jax.numpy as jnp
+            from jax.experimental import enable_x64
+            k, d = len(self.bounds), self.n_dim
+            mask, c = np.zeros((k, d), bool), np.zeros((k, d))
+            b, inverse, n_ell = np.zeros((k, d, d)), np.zeros((k, d, d)), np.zeros(k)
+            for i, bound in enumerate(self.bounds):
+                ellipsoid = bound
+                if not isinstance(bound, Ellipsoid):
+                    mask[i], ellipsoid = bound.dim_cube, bound.ellipsoid
+                if ellipsoid is not None:
+                    dims = np.flatnonzero(~mask[i])
+                    c[i, dims] = ellipsoid.c
+                    b[i][np.ix_(dims, dims)] = ellipsoid.B
+                    inverse[i][np.ix_(dims, dims)] = ellipsoid.B_inv
+                    n_ell[i] = len(dims)
+            with enable_x64():
+                self._parameters = tuple(jnp.asarray(a) for a in (
+                    self.log_v_all - logsumexp(self.log_v_all), mask, c, b, inverse, n_ell))
+        return self._parameters
+
+    def _jax_sample(self):
+        """Draw one device block, seeding solely from this bound's saved RNG."""
+        import jax
+        from jax.experimental import enable_x64
+        a, b = self.rng.integers(2**32, size=2)
+        with enable_x64():
+            key = jax.random.fold_in(jax.random.PRNGKey(int(a)), int(b))
+            points, keep = _jax_union(self.cube is not None)[1](self._jax_parameters(), key)
+            return np.asarray(points), np.asarray(keep)
 
     def sample(self, n_points=100):
         """Sample points from the bound.
@@ -305,6 +419,12 @@ class Union:
 
         """
         while len(self.points) < n_points:
+            if self.backend == 'jax':
+                points, keep = self._jax_sample()
+                self.points = np.vstack([self.points, points[keep]])
+                self.n_sample += len(points)
+                self.n_reject += len(points) - np.sum(keep)
+                continue
             n_sample = 1000
 
             p = np.exp(np.array(self.log_v_all) - logsumexp(self.log_v_all))
@@ -386,7 +506,7 @@ class Union:
         group['points'][...] = self.points
 
     @classmethod
-    def read(cls, group, rng=None):
+    def read(cls, group, rng=None, backend='auto'):
         """Read the bound from an HDF5 group.
 
         Parameters
@@ -403,6 +523,7 @@ class Union:
 
         """
         bound = cls()
+        bound.backend = resolve_backend(backend)
 
         if rng is None:
             bound.rng = np.random.default_rng()
@@ -413,6 +534,7 @@ class Union:
                     'n_sample', 'n_reject']:
             setattr(bound, key, group.attrs[key])
 
+        bound.cube = None
         if group.attrs['unit']:
             bound.cube = UnitCube.read(group['cube'], rng=bound.rng)
 
@@ -440,6 +562,7 @@ class Union:
             generation is not reset. Default is None.
 
         """
+        self.__dict__.pop('_parameters', None)
         self.points = np.zeros((0, self.n_dim))
         self.n_sample = 0
         self.n_reject = 0

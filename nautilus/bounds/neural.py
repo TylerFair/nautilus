@@ -1,10 +1,48 @@
 """Module implementing multi-dimensional neural network-based bounds."""
 
+from functools import lru_cache
+
 import numpy as np
 from scipy.stats import rankdata
 
-from ..neural import NeuralNetworkEmulator
+from ..neural import NeuralNetworkEmulator, _jax_call, _jax_forward, resolve_backend
 from .basic import Ellipsoid
+
+
+@lru_cache(maxsize=16)
+def _jax_neural(activations):
+    import jax
+    import jax.numpy as jnp
+
+    @jax.jit
+    def contains(parameters, points):
+        accepted = jnp.zeros(len(points), bool)
+        for (c, inverse, emulator, threshold), activation in zip(parameters, activations):
+            t = jnp.einsum('ij,nj->ni', inverse, points - c)
+            inside = jnp.sum(t**2, axis=-1) < 1
+            if emulator is not None:
+                inside &= _jax_forward(*activation)(emulator, t) > threshold - 1e-9
+            accepted |= inside
+        return accepted
+
+    return contains
+
+
+def _jax_neural_parameters(bounds):
+    import jax.numpy as jnp
+    from jax.experimental import enable_x64
+    parameters, activations = [], []
+    with enable_x64():
+        for bound in bounds:
+            emulator = bound.emulator
+            parameters.append((jnp.asarray(bound.outer_bound.c),
+                               jnp.asarray(bound.outer_bound.B_inv),
+                               None if emulator is None else emulator._jax_parameters()[1],
+                               jnp.asarray(bound.score_predict_min)))
+            network = None if emulator is None else emulator.neural_networks[0]
+            activations.append(None if network is None else (
+                network.activation, network.out_activation_))
+    return _jax_neural(tuple(activations)), tuple(parameters)
 
 
 class NeuralBound:
@@ -28,7 +66,7 @@ class NeuralBound:
     @classmethod
     def compute(cls, points, log_l, log_l_min, enlarge_per_dim=1.1,
                 n_networks=4, neural_network_kwargs=None, pool=None,
-                rng=None):
+                rng=None, backend='auto'):
         """Compute a neural network-based bound.
 
         Parameters
@@ -59,6 +97,8 @@ class NeuralBound:
 
         """
         bound = cls()
+        backend = resolve_backend(backend, pool)
+        bound.backend = backend
         bound.n_dim = points.shape[1]
 
         if rng is None:
@@ -67,7 +107,7 @@ class NeuralBound:
         # Determine the outer bound.
         bound.outer_bound = Ellipsoid.compute(
             points[log_l >= log_l_min], enlarge_per_dim=enlarge_per_dim,
-            rng=rng)
+            rng=rng, backend=backend)
 
         if n_networks == 0:
             bound.emulator = None
@@ -91,7 +131,7 @@ class NeuralBound:
             (rankdata(log_l[~select]) - 0.5) / np.sum(~select))
         bound.emulator = NeuralNetworkEmulator.train(
             points_t, score, n_networks=n_networks,
-            neural_network_kwargs=neural_network_kwargs, pool=pool)
+            neural_network_kwargs=neural_network_kwargs, pool=pool, backend=backend)
 
         bound.score_predict_min = np.polyval(np.polyfit(
             score, bound.emulator.predict(points_t), 3),
@@ -116,6 +156,10 @@ class NeuralBound:
 
         """
         points = np.atleast_2d(points)
+        if self.backend == 'jax':
+            if not hasattr(self, '_parameters'):
+                self._parameters = _jax_neural_parameters([self])
+            return _jax_call(*self._parameters, points)
 
         in_bound = self.outer_bound.contains(points)
         if np.any(in_bound) and self.emulator is not None:
@@ -144,7 +188,7 @@ class NeuralBound:
             self.emulator.write(group.create_group('emulator'))
 
     @classmethod
-    def read(cls, group, rng=None):
+    def read(cls, group, rng=None, backend='auto'):
         """Read the bound from an HDF5 group.
 
         Parameters
@@ -161,6 +205,7 @@ class NeuralBound:
 
         """
         bound = cls()
+        bound.backend = resolve_backend(backend)
 
         if rng is None:
             rng = np.random.default_rng()
@@ -169,7 +214,7 @@ class NeuralBound:
         bound.score_predict_min = group.attrs['score_predict_min']
         bound.outer_bound = Ellipsoid.read(group['outer_bound'], rng=rng)
         if 'emulator' in group:
-            bound.emulator = NeuralNetworkEmulator.read(group['emulator'])
+            bound.emulator = NeuralNetworkEmulator.read(group['emulator'], backend=backend)
         else:
             bound.emulator = None
 
