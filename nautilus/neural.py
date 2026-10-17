@@ -2,11 +2,14 @@
 
 import warnings
 import os
+import logging
 from functools import lru_cache, partial
 
 import numpy as np
 from sklearn.neural_network import MLPRegressor
 from threadpoolctl import threadpool_limits
+
+os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
 
 
 def resolve_backend(backend, pool=None):
@@ -17,10 +20,15 @@ def resolve_backend(backend, pool=None):
         return 'numpy'
     if backend != 'numpy':
         try:
-            os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
             import jax
-            return 'jax' if backend == 'jax' or any(
-                d.platform == 'gpu' for d in jax.devices()) else 'numpy'
+            if backend == 'jax':
+                return 'jax'
+            logger = logging.getLogger('jax._src.xla_bridge')
+            disabled, logger.disabled = logger.disabled, True
+            try:
+                return 'jax' if any(d.platform == 'gpu' for d in jax.devices()) else 'numpy'
+            finally:
+                logger.disabled = disabled
         except ImportError:
             if backend == 'jax':
                 raise ImportError("backend='jax' requires JAX") from None
@@ -64,8 +72,8 @@ def _jax_forward(activation='relu', output='identity'):
 
 
 @lru_cache(maxsize=16)
-def _jax_trainer(max_iter, batch_size):
-    """Cache executable shapes; data and stopping settings stay dynamic."""
+def _jax_trainer(max_iter, batch_size, n_rows):
+    """Cache by real row count: permutations never include padding slots."""
     import jax
     import jax.numpy as jnp
 
@@ -94,8 +102,10 @@ def _jax_trainer(max_iter, batch_size):
             epoch, state, history = carry
             params, moment, variance, step, key, best, stale, active, stopped = state
             key, *keys = jax.random.split(key, n_networks + 1)
-            permutations = jax.vmap(lambda k: jax.random.permutation(k, len(x)))(
-                jnp.stack(keys)).reshape(n_networks, -1, batch_size)
+            permutations = jax.vmap(lambda k: jax.random.permutation(k, n_rows))(
+                jnp.stack(keys))
+            permutations = jnp.pad(permutations, ((0, 0), (0, len(x) - n_rows)),
+                                   constant_values=n_rows).reshape(n_networks, -1, batch_size)
 
             def batch(state, indices):
                 params, moment, variance, step = state
@@ -105,18 +115,18 @@ def _jax_trainer(max_iter, batch_size):
                 moment = jax.tree.map(lambda m, g: 0.9 * m + 0.1 * g, moment, gradients)
                 variance = jax.tree.map(lambda v, g: 0.999 * v + 0.001 * g**2,
                                        variance, gradients)
-                proposed = jax.tree.map(
-                    lambda p, m, v: p - rate * (m / (1 - 0.9**step)) /
-                    (jnp.sqrt(v / (1 - 0.999**step)) + 1e-8), params, moment, variance)
+                rate_t = rate * jnp.sqrt(1 - 0.999**step) / (1 - 0.9**step)
+                proposed = jax.tree.map(lambda p, m, v: p - rate_t * m /
+                                       (jnp.sqrt(v) + 1e-8), params, moment, variance)
                 params = jax.tree.map(lambda p, q: jnp.where(
                     active.reshape((n_networks,) + (1,) * (p.ndim - 1)), q, p),
                     params, proposed)
-                return (params, moment, variance, step), losses
+                return (params, moment, variance, step), (losses, valid[indices].sum(axis=1))
 
-            (params, moment, variance, step), losses = jax.lax.scan(
+            (params, moment, variance, step), (losses, counts) = jax.lax.scan(
                 batch, (params, moment, variance, step), permutations.transpose(1, 0, 2))
-            losses = jnp.mean(losses, axis=0)
-            stale = jnp.where(losses < best - tol, 0, stale + active)
+            losses = jnp.sum(losses * counts, axis=0) / n_rows
+            stale = jnp.where(losses <= best - tol, 0, stale + active)
             best = jnp.minimum(best, losses)
             stopped = jnp.where(active & (stale > patience), epoch + 1, stopped)
             active &= stale <= patience
@@ -126,7 +136,7 @@ def _jax_trainer(max_iter, batch_size):
         _, state, history = jax.lax.while_loop(
             lambda c: (c[0] < max_iter) & jnp.any(c[1][7]), epoch,
             (0, initial, jnp.full((max_iter, n_networks), jnp.nan)))
-        return state[0], history, jnp.where(state[7], max_iter, state[8])
+        return state[0], history, jnp.where(state[7], max_iter, state[8]), state[3]
 
     return train
 
@@ -173,7 +183,7 @@ class NeuralNetworkEmulator:
 
     @classmethod
     def train(cls, x, y, n_networks=4, neural_network_kwargs=None, pool=None,
-              backend='auto'):
+              backend='numpy'):
         """Initialize and train the likelihood neural network emulator.
 
         Parameters
@@ -197,7 +207,7 @@ class NeuralNetworkEmulator:
 
         """
         emulator = cls()
-        emulator.backend = resolve_backend(backend, pool)
+        emulator.backend = backend if pool is None else 'numpy'
 
         emulator.mean = np.mean(x, axis=0)
         emulator.scale = np.std(x, axis=0)
@@ -226,30 +236,34 @@ class NeuralNetworkEmulator:
                    not (set(neural_network_kwargs) - options) and all(
                        neural_network_kwargs.get(k, v) == v for k, v in supported.items()))
         if use_jax:
+            networks = [MLPRegressor(random_state=i, **neural_network_kwargs)
+                        for i in range(n_networks)]
+            try:
+                # Match sklearn's per-network initialization, but tolerate API drift.
+                for network in networks:
+                    if hasattr(network, '_validate_params'):
+                        network._validate_params()
+                    network._random_state = np.random.RandomState(network.random_state)
+                    network._initialize(y[:, None], [x.shape[1], 100, 50, 20, 1], np.float64)
+            except (AttributeError, TypeError):
+                use_jax = False
+        if use_jax:
             import jax
             import jax.numpy as jnp
 
             normalized = (x - emulator.mean) / emulator.scale
-            networks = [MLPRegressor(random_state=i, **neural_network_kwargs)
-                        for i in range(n_networks)]
-            # sklearn's Glorot initialization keeps ensemble seeds compatible.
-            for network in networks:
-                if hasattr(network, '_validate_params'):
-                    network._validate_params()
-                network._random_state = np.random.RandomState(network.random_state)
-                network._initialize(y[:, None], [x.shape[1], 100, 50, 20, 1], np.float64)
             params = tuple(tuple(jnp.asarray(np.stack([getattr(n, attr)[i]
                            for n in networks]), dtype=jnp.float32) for i in range(4))
                            for attr in ('coefs_', 'intercepts_'))
             batch_size = neural_network_kwargs.get('batch_size', 'auto')
             batch_size = min(200, len(x)) if batch_size == 'auto' else min(batch_size, len(x))
-            capacity = max(256, 1 << (len(x) - 1).bit_length()) if len(x) < 8192 else (
-                (len(x) + 8191) // 8192 * 8192)
-            capacity = (capacity + batch_size - 1) // batch_size * batch_size
+            capacity = (len(x) + batch_size - 1) // batch_size * batch_size
             x_pad = np.pad(normalized, ((0, capacity - len(x)), (0, 0)))
             y_pad = np.pad(y, (0, capacity - len(y)))
-            weights, history, epochs = _jax_trainer(
-                neural_network_kwargs['max_iter'], batch_size)(
+            # A fresh, reproducible PRNGKey(0) shuffles each fit, independently
+            # of the sampler RNG and of sklearn's per-network initializer seeds.
+            weights, history, epochs, _ = _jax_trainer(
+                neural_network_kwargs['max_iter'], batch_size, len(x))(
                     params, jax.random.PRNGKey(0), jnp.asarray(x_pad, dtype=jnp.float32),
                     jnp.asarray(y_pad, dtype=jnp.float32), jnp.arange(capacity) < len(x),
                     neural_network_kwargs['learning_rate_init'],
@@ -260,6 +274,7 @@ class NeuralNetworkEmulator:
                 network.intercepts_ = [np.asarray(b[i], dtype=float) for b in weights[1]]
                 network.n_features_in_ = x.shape[1]
                 network.n_iter_ = int(epochs[i])
+                network.t_ = network.n_iter_ * len(x)
                 network.loss_curve_ = history[:epochs[i], i].astype(float).tolist()
                 network.loss_ = network.loss_curve_[-1]
             emulator.neural_networks = networks
@@ -346,7 +361,7 @@ class NeuralNetworkEmulator:
         group.create_dataset('scale', data=self.scale)
 
     @classmethod
-    def read(cls, group, backend='auto'):
+    def read(cls, group, backend='numpy'):
         """Read the emulator from an HDF5 group.
 
         Parameters
@@ -361,7 +376,7 @@ class NeuralNetworkEmulator:
 
         """
         emulator = cls()
-        emulator.backend = resolve_backend(backend)
+        emulator.backend = backend
 
         emulator.mean = np.array(group['mean'])
         emulator.scale = np.array(group['scale'])

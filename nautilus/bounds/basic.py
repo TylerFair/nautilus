@@ -7,8 +7,6 @@ from scipy.linalg.lapack import dpotrf, dpotri
 from scipy.special import gammaln
 from threadpoolctl import threadpool_limits
 
-from ..neural import resolve_backend
-
 
 class UnitCube:
     r"""Unit (hyper)cube bound.
@@ -214,7 +212,7 @@ def _jax_mvee(n_dim, n_max, n_batch):
 
 
 def minimum_volume_enclosing_ellipsoid(points, n_max=100, n_batch=20,
-                                       backend='auto'):
+                                       backend='numpy'):
     r"""Find an approximation to the minimum volume enclosing ellipsoid (MVEE).
 
     This functions finds an approximation to the MVEE using a modified version
@@ -251,7 +249,7 @@ def minimum_volume_enclosing_ellipsoid(points, n_max=100, n_batch=20,
 
     """
     n_points, n_dim = points.shape
-    if resolve_backend(backend) == 'jax' and n_max > 0 and n_batch > 0:
+    if backend == 'jax' and n_max > 0 and n_batch > 0:
         from jax.experimental import enable_x64
         covariance = np.atleast_2d(np.cov(points, rowvar=False, bias=True))
         if np.linalg.cond(covariance) <= 1e7:
@@ -330,7 +328,7 @@ class Ellipsoid:
     """
 
     @classmethod
-    def compute(cls, points, enlarge_per_dim=1.1, rng=None, backend='auto'):
+    def compute(cls, points, enlarge_per_dim=1.1, rng=None, backend='numpy'):
         """Compute the bound.
 
         Parameters
@@ -536,7 +534,7 @@ class UnitCubeEllipsoidMixture:
     """
 
     @classmethod
-    def compute(cls, points, enlarge_per_dim=1.1, rng=None, backend='auto'):
+    def compute(cls, points, enlarge_per_dim=1.1, rng=None, backend='numpy'):
         """Compute the bound.
 
         Parameters

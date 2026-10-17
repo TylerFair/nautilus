@@ -5,8 +5,8 @@ import os
 import pytest
 
 from nautilus import neural, sampler
-from nautilus.bounds import basic, nautilus, union
-from nautilus.bounds import neural as neural_bound
+from nautilus.bounds import basic
+from nautilus.bounds import NautilusBound, NeuralBound, Union
 
 
 if os.environ.get('NAUTILUS_TEST_BACKEND'):
@@ -23,5 +23,13 @@ def backend_for_tests(monkeypatch):
         def resolve(backend, pool=None):
             return original(selected if backend == 'auto' else backend, pool)
 
-        for module in (neural, sampler, basic, nautilus, union, neural_bound):
-            monkeypatch.setattr(module, 'resolve_backend', resolve)
+        monkeypatch.setattr(sampler, 'resolve_backend', resolve)
+        functions = [basic.minimum_volume_enclosing_ellipsoid]
+        for cls in (basic.Ellipsoid, basic.UnitCubeEllipsoidMixture, Union,
+                    NeuralBound, NautilusBound, neural.NeuralNetworkEmulator):
+            for name in ('compute', 'train', 'read'):
+                function = getattr(cls, name, None)
+                if function is not None and function.__func__.__defaults__[-1] == 'numpy':
+                    functions.append(function.__func__)
+        for function in functions:
+            monkeypatch.setattr(function, '__defaults__', function.__defaults__[:-1] + (selected,))

@@ -393,6 +393,9 @@ class Sampler:
                     self.bounds.append(NautilusBound.read(
                         fstream[f'bound_{i}'], rng=self.rng, backend=self.backend))
 
+    def __getstate__(self):
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_f_live_')}
+
     def run(self, f_live=0.01, n_shell=1, n_eff=10000, n_like_max=np.inf,
             discard_exploration=False, timeout=np.inf, verbose=False):
         """Run the sampler until convergence.

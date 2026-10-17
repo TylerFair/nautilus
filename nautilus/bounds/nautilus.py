@@ -5,7 +5,7 @@ from functools import partial
 import numpy as np
 from threadpoolctl import threadpool_limits
 
-from ..neural import _jax_call, resolve_backend
+from ..neural import _jax_call
 from .basic import Ellipsoid, UnitCubeEllipsoidMixture
 from .neural import NeuralBound, _jax_neural_parameters
 from .periodic import PhaseShift
@@ -42,7 +42,7 @@ class NautilusBound:
     def compute(cls, points, log_l, log_l_min, log_v_target,
                 enlarge_per_dim=1.1, n_points_min=None, split_threshold=100,
                 periodic=None, n_networks=4, neural_network_kwargs=None,
-                pool=None, rng=None, backend='auto'):
+                pool=None, rng=None, backend='numpy'):
         """Compute a union of multiple neural network-based bounds.
 
         Parameters
@@ -88,7 +88,7 @@ class NautilusBound:
 
         """
         bound = cls()
-        bound.backend = resolve_backend(backend, pool)
+        bound.backend = backend if pool is None else 'numpy'
         bound.n_dim = points.shape[1]
 
         if periodic is not None:
@@ -231,11 +231,14 @@ class NautilusBound:
             if pool is None:
                 while len(self.points) < n_points:
                     if self.backend == 'jax':
-                        points, keep = self.outer_bound._jax_sample(rng=self.rng)
+                        if not hasattr(self, '_parameters'):
+                            self._parameters = _jax_neural_parameters(self.neural_bounds)
+                        points, accepted, n_sample = self.outer_bound._jax_sample(
+                            rng=self.rng, neural=self._parameters)
                         self.outer_bound.n_sample += len(points)
-                        self.outer_bound.n_reject += len(points) - np.sum(keep)
-                        n_sample = int(np.sum(keep))
-                        points = points[keep & self._contains_neural(points)]
+                        n_sample = int(n_sample)
+                        self.outer_bound.n_reject += len(points) - n_sample
+                        points = points[accepted]
                     else:
                         n_sample = 1000
                         points = self.outer_bound.sample(n_sample)
@@ -361,7 +364,7 @@ class NautilusBound:
         group['points'][...] = self.points
 
     @classmethod
-    def read(cls, group, rng=None, backend='auto'):
+    def read(cls, group, rng=None, backend='numpy'):
         """Read the bound from an HDF5 group.
 
         Parameters
@@ -378,7 +381,7 @@ class NautilusBound:
 
         """
         bound = cls()
-        bound.backend = resolve_backend(backend)
+        bound.backend = backend
 
         if rng is None:
             bound.rng = np.random.default_rng()

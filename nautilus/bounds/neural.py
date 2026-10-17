@@ -5,7 +5,7 @@ from functools import lru_cache
 import numpy as np
 from scipy.stats import rankdata
 
-from ..neural import NeuralNetworkEmulator, _jax_call, _jax_forward, resolve_backend
+from ..neural import NeuralNetworkEmulator, _jax_call, _jax_forward
 from .basic import Ellipsoid
 
 
@@ -66,7 +66,7 @@ class NeuralBound:
     @classmethod
     def compute(cls, points, log_l, log_l_min, enlarge_per_dim=1.1,
                 n_networks=4, neural_network_kwargs=None, pool=None,
-                rng=None, backend='auto'):
+                rng=None, backend='numpy'):
         """Compute a neural network-based bound.
 
         Parameters
@@ -97,7 +97,7 @@ class NeuralBound:
 
         """
         bound = cls()
-        backend = resolve_backend(backend, pool)
+        backend = backend if pool is None else 'numpy'
         bound.backend = backend
         bound.n_dim = points.shape[1]
 
@@ -188,7 +188,7 @@ class NeuralBound:
             self.emulator.write(group.create_group('emulator'))
 
     @classmethod
-    def read(cls, group, rng=None, backend='auto'):
+    def read(cls, group, rng=None, backend='numpy'):
         """Read the bound from an HDF5 group.
 
         Parameters
@@ -205,7 +205,7 @@ class NeuralBound:
 
         """
         bound = cls()
-        bound.backend = resolve_backend(backend)
+        bound.backend = backend
 
         if rng is None:
             rng = np.random.default_rng()

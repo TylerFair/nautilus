@@ -9,12 +9,12 @@ from scipy.special import logsumexp
 from scipy.stats import multivariate_normal
 from sklearn.mixture import GaussianMixture
 
-from ..neural import _jax_call, resolve_backend
+from ..neural import _jax_call
 from .basic import Ellipsoid, UnitCube, UnitCubeEllipsoidMixture
 
 
-@lru_cache(maxsize=2)
-def _jax_union(use_cube):
+@lru_cache(maxsize=16)
+def _jax_union(use_cube, predicate=None):
     import jax
     import jax.numpy as jnp
 
@@ -32,7 +32,7 @@ def _jax_union(use_cube):
         return jnp.any(member, axis=0) & inside
 
     @jax.jit
-    def sample(parameters, key):
+    def sample(parameters, key, neural=()):
         log_p, mask, c, b, _, n_ell = parameters
         keys = jax.random.split(key, 5)
         component = jax.random.categorical(keys[0], log_p, shape=(16384,))
@@ -46,7 +46,21 @@ def _jax_union(use_cube):
         member, inside = membership(parameters, x)
         keep = inside & (jax.random.uniform(keys[4], (16384,), dtype=jnp.float64) *
                          jnp.maximum(jnp.sum(member, axis=0), 1) < 1)
-        return x, keep
+        if predicate is None:
+            return x, keep
+        # Compact on device before scoring. Only the last 1024-point chunk
+        # can contain padding; no host synchronization is needed for its size.
+        n_keep = jnp.sum(keep)
+        x = x[jnp.nonzero(keep, size=len(x), fill_value=0)[0]]
+
+        def score(i, accepted):
+            points = jax.lax.dynamic_slice(x, (i * 1024, 0), (1024, x.shape[1]))
+            mask = predicate(neural, points) & (i * 1024 + jnp.arange(1024) < n_keep)
+            return jax.lax.dynamic_update_slice(accepted, mask, (i * 1024,))
+
+        accepted = jax.lax.fori_loop(0, (n_keep + 1023) // 1024, score,
+                                    jnp.zeros(len(x), bool))
+        return x, accepted, n_keep
 
     return contains, sample
 
@@ -119,7 +133,7 @@ class Union:
 
     @classmethod
     def compute(cls, points, enlarge_per_dim=1.1, n_points_min=None,
-                unit=True, bound_class=Ellipsoid, rng=None, backend='auto'):
+                unit=True, bound_class=Ellipsoid, rng=None, backend='numpy'):
         """Compute the bound.
 
         Upon creation, the bound consists of a single individual bound.
@@ -157,7 +171,7 @@ class Union:
 
         """
         bound = cls()
-        bound.backend = resolve_backend(backend)
+        bound.backend = backend
         bound.n_dim = points.shape[1]
         bound.enlarge_per_dim = enlarge_per_dim
 
@@ -394,15 +408,17 @@ class Union:
                     self.log_v_all - logsumexp(self.log_v_all), mask, c, b, inverse, n_ell))
         return self._parameters
 
-    def _jax_sample(self, rng=None):
+    def _jax_sample(self, rng=None, neural=None):
         """Draw one device block, seeding solely from this bound's saved RNG."""
         import jax
         from jax.experimental import enable_x64
         a, b = (self.rng if rng is None else rng).integers(2**32, size=2)
         with enable_x64():
             key = jax.random.fold_in(jax.random.PRNGKey(int(a)), int(b))
-            points, keep = _jax_union(self.cube is not None)[1](self._jax_parameters(), key)
-            return np.asarray(points), np.asarray(keep)
+            predicate, parameters = (None, ()) if neural is None else neural
+            result = _jax_union(self.cube is not None, predicate)[1](
+                self._jax_parameters(), key, parameters)
+            return jax.device_get(result)
 
     def sample(self, n_points=100):
         """Sample points from the bound.
@@ -506,7 +522,7 @@ class Union:
         group['points'][...] = self.points
 
     @classmethod
-    def read(cls, group, rng=None, backend='auto'):
+    def read(cls, group, rng=None, backend='numpy'):
         """Read the bound from an HDF5 group.
 
         Parameters
@@ -523,7 +539,7 @@ class Union:
 
         """
         bound = cls()
-        bound.backend = resolve_backend(backend)
+        bound.backend = backend
 
         if rng is None:
             bound.rng = np.random.default_rng()
