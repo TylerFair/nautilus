@@ -1,8 +1,8 @@
 """Module implementing neural network emulators."""
 
-import warnings
-import os
 import logging
+import os
+import warnings
 from functools import lru_cache, partial
 
 import numpy as np
@@ -56,8 +56,9 @@ def _jax_forward(activation='relu', output='identity'):
     import jax
     import jax.numpy as jnp
 
-    activations = dict(identity=lambda x: x, relu=jax.nn.relu,
-                       tanh=jnp.tanh, logistic=jax.nn.sigmoid, exp=jnp.exp)
+    activations = {'identity': lambda x: x, 'relu': jax.nn.relu,
+                   'tanh': jnp.tanh, 'logistic': jax.nn.sigmoid,
+                   'exp': jnp.exp}
 
     @jax.jit
     def forward(parameters, x):
@@ -226,10 +227,11 @@ class NeuralNetworkEmulator:
             del neural_network_kwargs['random_state']
 
         # Unsupported sklearn configurations retain sklearn training/prediction.
-        supported = dict(hidden_layer_sizes=(100, 50, 20), activation='relu',
-                         solver='adam', alpha=0, learning_rate='constant',
-                         shuffle=True, early_stopping=False, beta_1=0.9,
-                         beta_2=0.999, epsilon=1e-8)
+        supported = {'hidden_layer_sizes': (100, 50, 20),
+                     'activation': 'relu', 'solver': 'adam', 'alpha': 0,
+                     'learning_rate': 'constant', 'shuffle': True,
+                     'early_stopping': False, 'beta_1': 0.9, 'beta_2': 0.999,
+                     'epsilon': 1e-8}
         options = set(supported) | {'learning_rate_init', 'max_iter', 'tol',
                                     'n_iter_no_change', 'batch_size'}
         use_jax = (emulator.backend == 'jax' and len(x) >= 4096 and
