@@ -1,5 +1,7 @@
 """Module implementing basic multi-dimensional bounds."""
 
+from functools import lru_cache
+
 import numpy as np
 from scipy.linalg.lapack import dpotrf, dpotri
 from scipy.special import gammaln
@@ -172,7 +174,45 @@ def invert_symmetric_positive_semidefinite_matrix(m):
     return m_inv_triangle + m_inv_triangle.T - np.diag(np.diag(m_inv_triangle))
 
 
-def minimum_volume_enclosing_ellipsoid(points, n_max=100, n_batch=20):
+@lru_cache(maxsize=64)
+def _jax_mvee(n_dim, n_max, n_batch):
+    import jax
+    import jax.numpy as jnp
+
+    @jax.jit
+    def weights(q, n):
+        u = jnp.where(jnp.arange(len(q)) < n, 1.0 / n, 0.0)
+        v = q.T @ (u[:, None] * q)
+
+        def outer(_, state):
+            u, v = state
+            inverse = jnp.linalg.inv(v)
+            scores = jnp.einsum('ni,ij,nj->n', q, inverse, q)
+            candidates = jnp.argsort(scores)[-n_batch:][::-1]
+
+            def inner(j, state):
+                u, v, inverse = state
+                index = candidates[j]
+                z = inverse @ q[index]
+                score = q[index] @ z
+                alpha = jnp.maximum(0, (score - n_dim - 1) /
+                                    ((n_dim + 1) * (score - 1)))
+                complement = 1 - alpha
+                v = complement * v + alpha * jnp.outer(q[index], q[index])
+                inverse = (inverse - alpha / (complement + alpha * score) *
+                           jnp.outer(z, z)) / complement
+                return u * complement + alpha * (jnp.arange(len(q)) == index), v, inverse
+
+            u, v, _ = jax.lax.fori_loop(0, n_batch, inner, (u, v, inverse))
+            return u, v
+
+        return jax.lax.fori_loop(0, n_max, outer, (u, v))[0]
+
+    return weights
+
+
+def minimum_volume_enclosing_ellipsoid(points, n_max=100, n_batch=20,
+                                       backend='numpy'):
     r"""Find an approximation to the minimum volume enclosing ellipsoid (MVEE).
 
     This functions finds an approximation to the MVEE using a modified version
@@ -209,6 +249,31 @@ def minimum_volume_enclosing_ellipsoid(points, n_max=100, n_batch=20):
 
     """
     n_points, n_dim = points.shape
+    if backend == 'jax' and n_max > 0 and n_batch > 0:
+        from jax.experimental import enable_x64
+        covariance = np.atleast_2d(np.cov(points, rowvar=False, bias=True))
+        if np.linalg.cond(covariance) <= 1e7:
+            try:
+                center = points.mean(axis=0)
+                x = np.linalg.solve(np.linalg.cholesky(covariance), (points - center).T).T
+                q = np.zeros((max(64, 1 << (n_points - 1).bit_length()), n_dim + 1))
+                q[:n_points, :n_dim], q[:n_points, n_dim] = x, 1
+                with enable_x64():
+                    u = np.asarray(_jax_mvee(n_dim, n_max, min(n_batch, n_points))(
+                        q, float(n_points)))[:n_points]
+                c = np.average(points, weights=u, axis=0)
+                A_inv = np.atleast_2d(np.cov(points, aweights=u, rowvar=False, bias=True))
+                A = np.linalg.inv(A_inv)
+                scale = np.max(np.einsum('ni,ij,nj->n', points - c, A, points - c))
+                A, A_inv = A / scale, A_inv * scale
+                radii = np.einsum('ni,ij,nj->n', points - c, A, points - c)
+                np.linalg.cholesky(A_inv)
+                if (np.all(np.isfinite(u)) and np.all(u >= 0) and
+                        np.all((radii >= -1e-8) & (radii <= 1 + 1e-8)) and
+                        np.allclose(A @ A_inv, np.eye(n_dim), rtol=1e-7, atol=1e-7)):
+                    return c, A, A_inv
+            except (FloatingPointError, np.linalg.LinAlgError):
+                pass  # Ill-conditioned fits retain the original algorithm.
     q = np.append(points, np.ones(shape=(n_points, 1)), axis=1)
     u = np.repeat(1.0 / n_points, n_points)
     q_outer = np.array([np.outer(q_i, q_i) for q_i in q])
@@ -263,7 +328,7 @@ class Ellipsoid:
     """
 
     @classmethod
-    def compute(cls, points, enlarge_per_dim=1.1, rng=None):
+    def compute(cls, points, enlarge_per_dim=1.1, rng=None, backend='numpy'):
         """Compute the bound.
 
         Parameters
@@ -301,7 +366,7 @@ class Ellipsoid:
 
         with threadpool_limits(limits=1):
             bound.c, bound.A, A_inv = minimum_volume_enclosing_ellipsoid(
-                points)
+                points, backend=backend)
 
         bound.A /= enlarge_per_dim**2.0
         A_inv *= enlarge_per_dim**2.0
@@ -469,7 +534,7 @@ class UnitCubeEllipsoidMixture:
     """
 
     @classmethod
-    def compute(cls, points, enlarge_per_dim=1.1, rng=None):
+    def compute(cls, points, enlarge_per_dim=1.1, rng=None, backend='numpy'):
         """Compute the bound.
 
         Parameters
@@ -491,7 +556,7 @@ class UnitCubeEllipsoidMixture:
         bound = cls()
         bound.n_dim = points.shape[1]
 
-        kwargs = dict(enlarge_per_dim=enlarge_per_dim, rng=rng)  # noqa: C408
+        kwargs = dict(enlarge_per_dim=enlarge_per_dim, rng=rng, backend=backend)  # noqa: C408
 
         # First, start by sampling all dimensions using an ellipsoid..
         ellipsoid = Ellipsoid.compute(points, **kwargs)

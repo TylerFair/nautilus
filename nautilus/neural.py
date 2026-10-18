@@ -1,11 +1,145 @@
 """Module implementing neural network emulators."""
 
+import logging
+import os
 import warnings
-from functools import partial
+from functools import lru_cache, partial
 
 import numpy as np
 from sklearn.neural_network import MLPRegressor
 from threadpoolctl import threadpool_limits
+
+os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
+
+
+def resolve_backend(backend, pool=None):
+    """Choose a backend, checking pools before importing/initializing JAX."""
+    if backend not in ('auto', 'jax', 'numpy'):
+        raise ValueError("backend must be 'auto', 'jax', or 'numpy'")
+    if pool is not None:
+        return 'numpy'
+    if backend != 'numpy':
+        try:
+            import jax
+            if backend == 'jax':
+                return 'jax'
+            logger = logging.getLogger('jax._src.xla_bridge')
+            disabled, logger.disabled = logger.disabled, True
+            try:
+                return 'jax' if any(d.platform == 'gpu' for d in jax.devices()) else 'numpy'
+            finally:
+                logger.disabled = disabled
+        except ImportError:
+            if backend == 'jax':
+                raise ImportError("backend='jax' requires JAX") from None
+    return 'numpy'
+
+
+def _jax_call(function, parameters, points):
+    """Evaluate geometry in bounded float64 buckets without consuming RNG."""
+    from jax.experimental import enable_x64
+    points = np.asarray(points, dtype=float)
+    shape = points.shape[:-1]
+    points = np.atleast_2d(points)
+    result = np.zeros(len(points), bool)
+    with enable_x64():
+        for start in range(0, len(points), 16384):
+            chunk = points[start:start + 16384]
+            size = next(n for n in (256, 1024, 4096, 16384) if n >= len(chunk))
+            result[start:start + len(chunk)] = np.asarray(function(
+                parameters, np.pad(chunk, ((0, size - len(chunk)), (0, 0)))))[:len(chunk)]
+    return result.reshape(shape)
+
+
+@lru_cache(maxsize=16)
+def _jax_forward(activation='relu', output='identity'):
+    import jax
+    import jax.numpy as jnp
+
+    activations = {'identity': lambda x: x, 'relu': jax.nn.relu,
+                   'tanh': jnp.tanh, 'logistic': jax.nn.sigmoid,
+                   'exp': jnp.exp}
+
+    @jax.jit
+    def forward(parameters, x):
+        weights, biases, mean, scale = parameters
+        values = (x - mean) / scale
+        for i, (weight, bias) in enumerate(zip(weights, biases)):
+            values = values @ weight + bias[:, None, :]
+            values = activations[activation if i < len(weights) - 1 else output](values)
+        return jnp.mean(values, axis=0)[:, 0]
+
+    return forward
+
+
+@lru_cache(maxsize=16)
+def _jax_trainer(max_iter, batch_size, n_rows):
+    """Cache by real row count: permutations never include padding slots."""
+    import jax
+    import jax.numpy as jnp
+
+    @jax.jit
+    def train(params, key, x, y, valid, rate, patience, tol):
+        n_networks = params[0][0].shape[0]
+        def loss(params, indices, active):
+            # Keep independent network predictions for independent gradients.
+            weights, biases = params
+            values = x[indices]
+            for i, (w, b) in enumerate(zip(weights, biases)):
+                values = values @ w + b[:, None, :]
+                if i < len(weights) - 1:
+                    values = jax.nn.relu(values)
+            mask = valid[indices]
+            losses = 0.5 * jnp.sum((values[:, :, 0] - y[indices])**2 * mask, axis=1)
+            losses /= jnp.maximum(jnp.sum(mask, axis=1), 1)
+            return jnp.sum(losses * active), losses
+
+        zeros = jax.tree.map(jnp.zeros_like, params)
+        initial = (params, zeros, zeros, 0, key,
+                   jnp.full(n_networks, jnp.inf), jnp.zeros(n_networks, int),
+                   jnp.ones(n_networks, bool), jnp.zeros(n_networks, int))
+
+        def epoch(carry):
+            epoch, state, history = carry
+            params, moment, variance, step, key, best, stale, active, stopped = state
+            key, *keys = jax.random.split(key, n_networks + 1)
+            permutations = jax.vmap(lambda k: jax.random.permutation(k, n_rows))(
+                jnp.stack(keys))
+            permutations = jnp.pad(permutations, ((0, 0), (0, len(x) - n_rows)),
+                                   constant_values=n_rows).reshape(n_networks, -1, batch_size)
+
+            def batch(state, indices):
+                params, moment, variance, step = state
+                (_, losses), gradients = jax.value_and_grad(loss, has_aux=True)(
+                    params, indices, active)
+                step += 1
+                moment = jax.tree.map(lambda m, g: 0.9 * m + 0.1 * g, moment, gradients)
+                variance = jax.tree.map(lambda v, g: 0.999 * v + 0.001 * g**2,
+                                       variance, gradients)
+                rate_t = rate * jnp.sqrt(1 - 0.999**step) / (1 - 0.9**step)
+                proposed = jax.tree.map(lambda p, m, v: p - rate_t * m /
+                                       (jnp.sqrt(v) + 1e-8), params, moment, variance)
+                params = jax.tree.map(lambda p, q: jnp.where(
+                    active.reshape((n_networks,) + (1,) * (p.ndim - 1)), q, p),
+                    params, proposed)
+                return (params, moment, variance, step), (losses, valid[indices].sum(axis=1))
+
+            (params, moment, variance, step), (losses, counts) = jax.lax.scan(
+                batch, (params, moment, variance, step), permutations.transpose(1, 0, 2))
+            losses = jnp.sum(losses * counts, axis=0) / n_rows
+            stale = jnp.where(losses <= best - tol, 0, stale + active)
+            best = jnp.minimum(best, losses)
+            stopped = jnp.where(active & (stale > patience), epoch + 1, stopped)
+            active &= stale <= patience
+            state = (params, moment, variance, step, key, best, stale, active, stopped)
+            return epoch + 1, state, history.at[epoch].set(losses)
+
+        _, state, history = jax.lax.while_loop(
+            lambda c: (c[0] < max_iter) & jnp.any(c[1][7]), epoch,
+            (0, initial, jnp.full((max_iter, n_networks), jnp.nan)))
+        return state[0], history, jnp.where(state[7], max_iter, state[8]), state[3]
+
+    return train
 
 
 @threadpool_limits.wrap(limits=1)
@@ -49,7 +183,8 @@ class NeuralNetworkEmulator:
     """
 
     @classmethod
-    def train(cls, x, y, n_networks=4, neural_network_kwargs=None, pool=None):
+    def train(cls, x, y, n_networks=4, neural_network_kwargs=None, pool=None,
+              backend='numpy'):
         """Initialize and train the likelihood neural network emulator.
 
         Parameters
@@ -73,6 +208,7 @@ class NeuralNetworkEmulator:
 
         """
         emulator = cls()
+        emulator.backend = backend if pool is None else 'numpy'
 
         emulator.mean = np.mean(x, axis=0)
         emulator.scale = np.std(x, axis=0)
@@ -89,6 +225,62 @@ class NeuralNetworkEmulator:
                           " neural network is ignored.", Warning, stacklevel=2)
             neural_network_kwargs = neural_network_kwargs.copy()
             del neural_network_kwargs['random_state']
+
+        # Unsupported sklearn configurations retain sklearn training/prediction.
+        supported = {'hidden_layer_sizes': (100, 50, 20),
+                     'activation': 'relu', 'solver': 'adam', 'alpha': 0,
+                     'learning_rate': 'constant', 'shuffle': True,
+                     'early_stopping': False, 'beta_1': 0.9, 'beta_2': 0.999,
+                     'epsilon': 1e-8}
+        options = set(supported) | {'learning_rate_init', 'max_iter', 'tol',
+                                    'n_iter_no_change', 'batch_size'}
+        use_jax = (emulator.backend == 'jax' and len(x) >= 4096 and
+                   not (set(neural_network_kwargs) - options) and all(
+                       neural_network_kwargs.get(k, v) == v for k, v in supported.items()))
+        if use_jax:
+            networks = [MLPRegressor(random_state=i, **neural_network_kwargs)
+                        for i in range(n_networks)]
+            try:
+                # Match sklearn's per-network initialization, but tolerate API drift.
+                for network in networks:
+                    if hasattr(network, '_validate_params'):
+                        network._validate_params()
+                    network._random_state = np.random.RandomState(network.random_state)
+                    network._initialize(y[:, None], [x.shape[1], 100, 50, 20, 1], np.float64)
+            except (AttributeError, TypeError):
+                use_jax = False
+        if use_jax:
+            import jax
+            import jax.numpy as jnp
+
+            normalized = (x - emulator.mean) / emulator.scale
+            params = tuple(tuple(jnp.asarray(np.stack([getattr(n, attr)[i]
+                           for n in networks]), dtype=jnp.float32) for i in range(4))
+                           for attr in ('coefs_', 'intercepts_'))
+            batch_size = neural_network_kwargs.get('batch_size', 'auto')
+            batch_size = min(200, len(x)) if batch_size == 'auto' else min(batch_size, len(x))
+            capacity = (len(x) + batch_size - 1) // batch_size * batch_size
+            x_pad = np.pad(normalized, ((0, capacity - len(x)), (0, 0)))
+            y_pad = np.pad(y, (0, capacity - len(y)))
+            # A fresh, reproducible PRNGKey(0) shuffles each fit, independently
+            # of the sampler RNG and of sklearn's per-network initializer seeds.
+            weights, history, epochs, _ = _jax_trainer(
+                neural_network_kwargs['max_iter'], batch_size, len(x))(
+                    params, jax.random.PRNGKey(0), jnp.asarray(x_pad, dtype=jnp.float32),
+                    jnp.asarray(y_pad, dtype=jnp.float32), jnp.arange(capacity) < len(x),
+                    neural_network_kwargs['learning_rate_init'],
+                    neural_network_kwargs['n_iter_no_change'], neural_network_kwargs['tol'])
+            weights, history, epochs = jax.device_get((weights, history, epochs))
+            for i, network in enumerate(networks):
+                network.coefs_ = [np.asarray(w[i], dtype=float) for w in weights[0]]
+                network.intercepts_ = [np.asarray(b[i], dtype=float) for b in weights[1]]
+                network.n_features_in_ = x.shape[1]
+                network.n_iter_ = int(epochs[i])
+                network.t_ = network.n_iter_ * len(x)
+                network.loss_curve_ = history[:epochs[i], i].astype(float).tolist()
+                network.loss_ = network.loss_curve_[-1]
+            emulator.neural_networks = networks
+            return emulator
 
         f = partial(train_network, (x - emulator.mean) / emulator.scale, y,
                     neural_network_kwargs)
@@ -114,9 +306,32 @@ class NeuralNetworkEmulator:
             Emulated normalized likelihood value of the training points.
 
         """
+        if getattr(self, 'backend', 'numpy') == 'jax' and len(x) >= 256:
+            from jax.experimental import enable_x64
+            with enable_x64():
+                forward, params = self._jax_parameters()
+                # Fixed chunks avoid a new compilation for each proposal count.
+                result = [np.asarray(forward(params, np.pad(chunk,
+                          ((0, 1024 - len(chunk)), (0, 0)))))[:len(chunk)]
+                          for start in range(0, len(x), 1024)
+                          for chunk in [x[start:start + 1024]]]
+            return np.concatenate(result)
         return np.mean(
             [network.predict((x - self.mean) / self.scale) for network in
              self.neural_networks], axis=0)
+
+    def _jax_parameters(self):
+        """Cache device weights; the HDF5 writer only visits sklearn networks."""
+        if not hasattr(self, '_parameters'):
+            import jax.numpy as jnp
+            networks = self.neural_networks
+            self._parameters = (tuple(jnp.asarray(np.stack([n.coefs_[i] for n in networks]))
+                                     for i in range(len(networks[0].coefs_))),
+                                tuple(jnp.asarray(np.stack([n.intercepts_[i] for n in networks]))
+                                     for i in range(len(networks[0].intercepts_))),
+                                jnp.asarray(self.mean), jnp.asarray(self.scale))
+        network = self.neural_networks[0]
+        return _jax_forward(network.activation, network.out_activation_), self._parameters
 
     def write(self, group):
         """Write the emulator to an HDF5 group.
@@ -148,7 +363,7 @@ class NeuralNetworkEmulator:
         group.create_dataset('scale', data=self.scale)
 
     @classmethod
-    def read(cls, group):
+    def read(cls, group, backend='numpy'):
         """Read the emulator from an HDF5 group.
 
         Parameters
@@ -163,6 +378,7 @@ class NeuralNetworkEmulator:
 
         """
         emulator = cls()
+        emulator.backend = backend
 
         emulator.mean = np.array(group['mean'])
         emulator.scale = np.array(group['scale'])

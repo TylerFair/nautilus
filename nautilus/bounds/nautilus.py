@@ -5,8 +5,9 @@ from functools import partial
 import numpy as np
 from threadpoolctl import threadpool_limits
 
+from ..neural import _jax_call
 from .basic import Ellipsoid, UnitCubeEllipsoidMixture
-from .neural import NeuralBound
+from .neural import NeuralBound, _jax_neural_parameters
 from .periodic import PhaseShift
 from .union import Union
 
@@ -41,7 +42,7 @@ class NautilusBound:
     def compute(cls, points, log_l, log_l_min, log_v_target,
                 enlarge_per_dim=1.1, n_points_min=None, split_threshold=100,
                 periodic=None, n_networks=4, neural_network_kwargs=None,
-                pool=None, rng=None):
+                pool=None, rng=None, backend='numpy'):
         """Compute a union of multiple neural network-based bounds.
 
         Parameters
@@ -87,6 +88,7 @@ class NautilusBound:
 
         """
         bound = cls()
+        bound.backend = backend if pool is None else 'numpy'
         bound.n_dim = points.shape[1]
 
         if periodic is not None:
@@ -101,7 +103,7 @@ class NautilusBound:
         multi_ellipsoid = Union.compute(
             points[log_l >= log_l_min], enlarge_per_dim=enlarge_per_dim,
             n_points_min=n_points_min, bound_class=Ellipsoid,
-            rng=rng)
+            rng=rng, backend=bound.backend)
 
         while multi_ellipsoid.split(allow_overlap=False):
             pass
@@ -115,12 +117,12 @@ class NautilusBound:
                 points[select], log_l[select], log_l_min,
                 enlarge_per_dim=enlarge_per_dim, n_networks=n_networks,
                 neural_network_kwargs=neural_network_kwargs, pool=pool,
-                rng=rng))
+                rng=rng, backend=bound.backend))
 
         bound.outer_bound = Union.compute(
             points[log_l >= log_l_min], enlarge_per_dim=enlarge_per_dim,
             n_points_min=n_points_min, bound_class=UnitCubeEllipsoidMixture,
-            rng=rng)
+            rng=rng, backend=bound.backend)
 
         # If the single bounding ellipsoid is too large, split ellipsoids
         # further.
@@ -167,10 +169,15 @@ class NautilusBound:
             points = self.shift.transform(points)
         in_bound = self.outer_bound.contains(points)
         if len(self.neural_bounds) > 0:
-            in_bound = in_bound & np.any(
-                [bound.contains(points) for bound in self.neural_bounds],
-                axis=0)
+            in_bound = in_bound & self._contains_neural(points)
         return in_bound
+
+    def _contains_neural(self, points):
+        if self.backend == 'jax':
+            if not hasattr(self, '_parameters'):
+                self._parameters = _jax_neural_parameters(self.neural_bounds)
+            return _jax_call(*self._parameters, points)
+        return np.any([bound.contains(points) for bound in self.neural_bounds], axis=0)
 
     @threadpool_limits.wrap(limits=1)
     def _reset_and_sample(self, n_points=100, rng=None):
@@ -194,7 +201,7 @@ class NautilusBound:
         self.sample(n_points=n_points, return_points=False)
         return self
 
-    def sample(self, n_points=100, return_points=True, pool=None):
+    def sample(self, n_points=100, return_points=True, pool=None, _max_draws=None):
         """Sample points from the the bound.
 
         Parameters
@@ -213,17 +220,36 @@ class NautilusBound:
             Points as two-dimensional array of shape (n_points, n_dim).
 
         """
+        if pool is not None and self.backend == 'jax':
+            # A bound built serially may subsequently be sent to a spawn pool.
+            for obj in [self, self.outer_bound] + self.neural_bounds + [
+                    b.emulator for b in self.neural_bounds if b.emulator is not None]:
+                obj.backend = 'numpy'
+                obj.__dict__.pop('_parameters', None)
+        start_sample, start_points = self.n_sample, len(self.points)
         if len(self.points) < n_points:
             if pool is None:
                 while len(self.points) < n_points:
-                    n_sample = 1000
-                    points = self.outer_bound.sample(n_sample)
-                    in_bound = np.any([bound.contains(points) for bound in
-                                       self.neural_bounds], axis=0)
-                    points = points[in_bound]
+                    if self.backend == 'jax':
+                        if not hasattr(self, '_parameters'):
+                            self._parameters = _jax_neural_parameters(self.neural_bounds)
+                        points, accepted, n_sample = self.outer_bound._jax_sample(
+                            rng=self.rng, neural=self._parameters)
+                        self.outer_bound.n_sample += len(points)
+                        n_sample = int(n_sample)
+                        self.outer_bound.n_reject += len(points) - n_sample
+                        points = points[accepted]
+                    else:
+                        n_sample = 1000
+                        points = self.outer_bound.sample(n_sample)
+                        points = points[self._contains_neural(points)]
                     self.points = np.vstack([self.points, points])
                     self.n_sample += n_sample
                     self.n_reject += n_sample - len(points)
+                    if (_max_draws is not None and self.n_sample - start_sample >= _max_draws
+                            and len(self.points) - start_points < 10):
+                        self._empty = True
+                        return None
             else:
                 n_jobs = pool.size
                 n_points_per_job = (
@@ -258,6 +284,8 @@ class NautilusBound:
             accurate as more points are sampled.
 
         """
+        if getattr(self, '_empty', False):
+            return np.inf
         if self.n_sample == 0:
             self.sample(return_points=False)
 
@@ -336,7 +364,7 @@ class NautilusBound:
         group['points'][...] = self.points
 
     @classmethod
-    def read(cls, group, rng=None):
+    def read(cls, group, rng=None, backend='numpy'):
         """Read the bound from an HDF5 group.
 
         Parameters
@@ -353,6 +381,7 @@ class NautilusBound:
 
         """
         bound = cls()
+        bound.backend = backend
 
         if rng is None:
             bound.rng = np.random.default_rng()
@@ -370,10 +399,10 @@ class NautilusBound:
         i = 0
         while f'neural_bound_{i}' in group:
             bound.neural_bounds.append(NeuralBound.read(
-                group[f'neural_bound_{i}'], rng=bound.rng))
+                group[f'neural_bound_{i}'], rng=bound.rng, backend=bound.backend))
             i += 1
 
-        bound.outer_bound = Union.read(group['outer_bound'], rng=rng)
+        bound.outer_bound = Union.read(group['outer_bound'], rng=rng, backend=bound.backend)
 
         bound.points = np.array(group['points'])
         bound.n_sample = group.attrs['n_sample']
