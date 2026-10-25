@@ -1,8 +1,10 @@
 """Module implementing the Nautilus sampler."""
 
+import os
 from functools import partial
 from pathlib import Path
 from shutil import get_terminal_size
+from tempfile import TemporaryDirectory
 from time import time
 from warnings import warn
 
@@ -19,6 +21,28 @@ from .neural import resolve_backend
 from .pool import NautilusPool, likelihood_worker
 
 _F_LIVE_UNSET = object()
+
+
+def _append_rows(array, values):
+    """Append rows without repeatedly copying an entire growing shell.
+
+    Each returned view has its own fixed length; appending never changes the
+    existing rows. Limit spare capacity to 65536 rows per array so that large
+    shells do not reserve a multiple of their total size.
+    """
+    size = len(array) + len(values)
+    dtype = np.result_type(array, values)
+    buffer = array.base
+    if not (isinstance(buffer, np.ndarray) and
+            buffer.ndim == array.ndim and buffer.shape[1:] == array.shape[1:] and
+            buffer.dtype == dtype and buffer.flags.c_contiguous and
+            buffer.flags.writeable and array.flags.c_contiguous and
+            array.ctypes.data == buffer.ctypes.data and len(buffer) >= size):
+        capacity = max(size, len(array) + min(max(len(array) // 8, 512), 65536))
+        buffer = np.empty((capacity,) + array.shape[1:], dtype=dtype)
+        buffer[:len(array)] = array
+    buffer[len(array):size] = values
+    return buffer[:size]
 
 
 class Sampler:
@@ -960,9 +984,10 @@ class Sampler:
         if self.shell_n[index] > 0:
             self.shell_log_v[index] = (self.bounds[index].log_v +
                                        np.log(shell_n / shell_n_sample))
-            self.shell_log_l[index] = logsumexp(log_l) - np.log(shell_n)
+            log_sum = logsumexp(log_l)
+            self.shell_log_l[index] = log_sum - np.log(shell_n)
             if not np.all(log_l == -np.inf):
-                self.shell_n_eff[index] = np.exp(2 * logsumexp(log_l) -
+                self.shell_n_eff[index] = np.exp(2 * log_sum -
                                                  logsumexp(2 * log_l))
             else:
                 self.shell_n_eff[index] = len(log_l)
@@ -1151,13 +1176,13 @@ class Sampler:
             if verbose:
                 self.print_status('Computing', end='\r', f_live=f_live)
             if len(idx_t) > 0:
-                self.points[-1] = np.concatenate((
-                    self.points[-1], self.points_t[idx_t]))
-                self.log_l[-1] = np.concatenate((
-                    self.log_l[-1], self.log_l_t[idx_t]))
+                self.points[-1] = _append_rows(
+                    self.points[-1], self.points_t[idx_t])
+                self.log_l[-1] = _append_rows(
+                    self.log_l[-1], self.log_l_t[idx_t])
                 if self.blobs is not None:
-                    self.blobs[-1] = np.concatenate((
-                        self.blobs[-1], self.blobs_t[idx_t]))
+                    self.blobs[-1] = _append_rows(
+                        self.blobs[-1], self.blobs_t[idx_t])
         else:
             points, n_bound = self.sample_shell(shell)
             if verbose:
@@ -1165,13 +1190,13 @@ class Sampler:
 
         self.shell_n_sample[shell] += n_bound
         log_l, blobs = self.evaluate_likelihood(points)
-        self.points[shell] = np.append(self.points[shell], points, axis=0)
-        self.log_l[shell] = np.append(self.log_l[shell], log_l, axis=0)
+        self.points[shell] = _append_rows(self.points[shell], points)
+        self.log_l[shell] = _append_rows(self.log_l[shell], log_l)
         if blobs is not None:
             if self.blobs is None:
                 self.blobs = [blobs]
             else:
-                self.blobs[shell] = np.append(self.blobs[shell], blobs, axis=0)
+                self.blobs[shell] = _append_rows(self.blobs[shell], blobs)
         self.update_shell_info(shell)
 
         return np.sum(log_l >= self.shell_log_l_min[shell])
@@ -1360,16 +1385,31 @@ class Sampler:
         if filepath.suffix not in ['.h5', '.hdf5']:
             raise ValueError("File ending must '.h5' or '.hdf5'.")
 
-        if filepath.exists():
-            if not overwrite:
-                raise RuntimeError(
-                    f"File {filepath!s} already exists.")
-            else:
-                filepath.unlink()
+        if filepath.exists() and not overwrite:
+            raise RuntimeError(f"File {filepath!s} already exists.")
 
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
-        fstream = h5py.File(filepath, 'x')
+        # Close a complete sibling file before publishing it. An interrupted
+        # full write leaves the previous checkpoint available for resuming.
+        with TemporaryDirectory(dir=filepath.parent,
+                                prefix='.nautilus-') as directory:
+            temporary = Path(directory) / filepath.name
+            with h5py.File(temporary, 'w') as fstream:
+                self._write(fstream)
+            if overwrite:
+                os.replace(temporary, filepath)
+            else:
+                # Unlike replace(), link() also preserves a destination created
+                # by another writer since the existence check above.
+                try:
+                    os.link(temporary, filepath)
+                except FileExistsError:
+                    raise RuntimeError(
+                        f"File {filepath!s} already exists.") from None
+
+    def _write(self, fstream):
+        """Serialize a full checkpoint into an open, unpublished HDF5 file."""
         group = fstream.create_group('sampler')
 
         for key in ['n_dim', 'n_live', 'n_update', 'n_like_new_bound',
@@ -1415,10 +1455,12 @@ class Sampler:
         group.attrs['rng_has_uint32'] = rng_state['has_uint32']
         group.attrs['rng_uinteger'] = rng_state['uinteger']
 
-        fstream.close()
-
     def write_shell_update(self, filepath, shell):
-        """Update the sampler data for a single shell.
+        """Append new samples and update the metadata for a single shell.
+
+        Existing samples and transfer coordinates must be unchanged since the
+        last write. Use :meth:`write` after changing existing samples or bounds.
+        Unlike a full write, this in-place update is not atomic.
 
         Parameters
         ----------
@@ -1430,7 +1472,11 @@ class Sampler:
         """
         if shell < 0:
             shell = len(self.bounds) + shell
-        fstream = h5py.File(Path(filepath), 'r+')
+        with h5py.File(Path(filepath), 'r+') as fstream:
+            self._write_shell_update(fstream, shell)
+
+    def _write_shell_update(self, fstream, shell):
+        """Update one append-only shell in an open checkpoint."""
         group = fstream['sampler']
 
         for key in ['n_like', 'shell_n', 'shell_n_sample', 'shell_n_eff',
@@ -1438,18 +1484,20 @@ class Sampler:
                     'n_update_iter', 'n_like_iter']:
             group.attrs[key] = getattr(self, key)
 
-        group[f'points_{shell}'].resize(self.points[shell].shape)
-        group[f'points_{shell}'][...] = self.points[shell]
-        group[f'log_l_{shell}'].resize(self.log_l[shell].shape)
-        group[f'log_l_{shell}'][...] = self.log_l[shell]
-        if self.blobs is not None:
-            group[f'blobs_{shell}'].resize(self.blobs[shell].shape)
-            group[f'blobs_{shell}'][...] = self.blobs[shell]
+        keys = ['points', 'log_l'] + (['blobs'] if self.blobs is not None else [])
+        for key in keys:
+            values = getattr(self, key)[shell]
+            dataset = group[f'{key}_{shell}']
+            start = len(dataset)
+            if start > len(values):
+                start = 0
+            dataset.resize(values.shape)
+            dataset[start:] = values[start:]
 
-        for key in ['points_t', 'shell_t', 'log_l_t', 'blobs_t']:
-            if getattr(self, key) is not None:
-                group[key].resize(getattr(self, key).shape)
-                group[key][...] = getattr(self, key)
+        # Only the transfer labels change between full writes, as candidates
+        # are consumed. The coordinates, likelihoods and blobs remain fixed.
+        if not self.explored:
+            group['shell_t'][...] = self.shell_t
 
         if isinstance(self.bounds[shell], NautilusBound):
             self.bounds[shell].update(fstream[f'bound_{shell}'])
@@ -1459,5 +1507,3 @@ class Sampler:
         group.attrs['rng_inc'] = str(rng_state['state']['inc'])
         group.attrs['rng_has_uint32'] = rng_state['has_uint32']
         group.attrs['rng_uinteger'] = rng_state['uinteger']
-
-        fstream.close()
