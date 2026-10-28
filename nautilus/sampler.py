@@ -850,7 +850,7 @@ class Sampler:
                 for bound in self.bounds[index:][1:]:
                     in_shell = in_shell & ~bound.contains(points)
                     if np.all(~in_shell):
-                        continue
+                        break
                 points = points[in_shell]
 
                 # Replace points for which we can use transfer points.
