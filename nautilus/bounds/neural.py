@@ -66,7 +66,7 @@ class NeuralBound:
     @classmethod
     def compute(cls, points, log_l, log_l_min, enlarge_per_dim=1.1,
                 n_networks=4, neural_network_kwargs=None, pool=None,
-                rng=None, backend='numpy'):
+                rng=None, backend='numpy', warm_start=None):
         """Compute a neural network-based bound.
 
         Parameters
@@ -89,6 +89,8 @@ class NeuralBound:
             Pool used for parallel processing. Default is None.
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
+        warm_start : NeuralNetworkEmulator or None, optional
+            Emulator whose networks initialize JAX training. Default is None.
 
         Returns
         -------
@@ -131,7 +133,8 @@ class NeuralBound:
             (rankdata(log_l[~select]) - 0.5) / np.sum(~select))
         bound.emulator = NeuralNetworkEmulator.train(
             points_t, score, n_networks=n_networks,
-            neural_network_kwargs=neural_network_kwargs, pool=pool, backend=backend)
+            neural_network_kwargs=neural_network_kwargs, pool=pool, backend=backend,
+            warm_start=warm_start)
 
         bound.score_predict_min = np.polyval(np.polyfit(
             score, bound.emulator.predict(points_t), 3),

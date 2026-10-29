@@ -115,3 +115,23 @@ minimum_volume_enclosing_ellipsoid(np.random.default_rng(0).normal(size=(30, 2))
 assert 'jax' not in sys.modules
 '''
     subprocess.run([sys.executable, '-c', code], check=True)
+
+
+def test_warm_start_initializes_from_previous_networks():
+    pytest.importorskip('jax')
+    from nautilus.neural import NeuralNetworkEmulator
+    rng = np.random.default_rng(0)
+    x = rng.random((6000, 5))
+    y = np.exp(-8 * np.sum((x - 0.5)**2, axis=1))
+    previous = NeuralNetworkEmulator.train(x, y, n_networks=4, backend='jax')
+    x = x + 0.01 * rng.standard_normal(x.shape)
+    y = np.exp(-8 * np.sum((x - 0.5)**2, axis=1))
+    cold = NeuralNetworkEmulator.train(x, y, n_networks=4, backend='jax')
+    warm = NeuralNetworkEmulator.train(x, y, n_networks=4, backend='jax',
+                                       warm_start=previous)
+    assert (sum(n.n_iter_ for n in warm.neural_networks) <
+            sum(n.n_iter_ for n in cold.neural_networks))
+    # Mismatched network counts fall back to the ordinary initialization.
+    other = NeuralNetworkEmulator.train(x, y, n_networks=3, backend='jax',
+                                        warm_start=previous)
+    assert len(other.neural_networks) == 3

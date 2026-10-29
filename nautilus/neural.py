@@ -184,7 +184,7 @@ class NeuralNetworkEmulator:
 
     @classmethod
     def train(cls, x, y, n_networks=4, neural_network_kwargs=None, pool=None,
-              backend='numpy'):
+              backend='numpy', warm_start=None):
         """Initialize and train the likelihood neural network emulator.
 
         Parameters
@@ -200,6 +200,10 @@ class NeuralNetworkEmulator:
             MLPRegressor. Default is `None`.
         pool : multiprocessing.Pool, optional
             Pool used for parallel processing.
+        warm_start : NeuralNetworkEmulator or None, optional
+            Emulator whose networks initialize JAX training when their shapes
+            match. Consecutive bounds are similar, so training stops after
+            fewer epochs. Ignored for sklearn training. Default is None.
 
         Returns
         -------
@@ -257,6 +261,13 @@ class NeuralNetworkEmulator:
             params = tuple(tuple(jnp.asarray(np.stack([getattr(n, attr)[i]
                            for n in networks]), dtype=jnp.float32) for i in range(4))
                            for attr in ('coefs_', 'intercepts_'))
+            previous = getattr(warm_start, 'neural_networks', None)
+            if previous is not None and len(previous) == n_networks:
+                initial = tuple(tuple(jnp.asarray(np.stack([getattr(n, attr)[i]
+                                for n in previous]), dtype=jnp.float32) for i in range(4))
+                                for attr in ('coefs_', 'intercepts_'))
+                if jax.tree.map(jnp.shape, initial) == jax.tree.map(jnp.shape, params):
+                    params = initial
             batch_size = neural_network_kwargs.get('batch_size', 'auto')
             batch_size = min(200, len(x)) if batch_size == 'auto' else min(batch_size, len(x))
             capacity = (len(x) + batch_size - 1) // batch_size * batch_size

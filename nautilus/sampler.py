@@ -1085,7 +1085,8 @@ class Sampler:
                         periodic=self.periodic,
                         n_networks=self.n_networks,
                         neural_network_kwargs=self.neural_network_kwargs,
-                        pool=self.pool_s, rng=self.rng, backend=self.backend)
+                        pool=self.pool_s, rng=self.rng, backend=self.backend,
+                        warm_start=self.bounds[-1])
                     bound.sample(1000, return_points=False, pool=self.pool_s,
                                  _max_draws=5_000_000)
 

@@ -42,7 +42,7 @@ class NautilusBound:
     def compute(cls, points, log_l, log_l_min, log_v_target,
                 enlarge_per_dim=1.1, n_points_min=None, split_threshold=100,
                 periodic=None, n_networks=4, neural_network_kwargs=None,
-                pool=None, rng=None, backend='numpy'):
+                pool=None, rng=None, backend='numpy', warm_start=None):
         """Compute a union of multiple neural network-based bounds.
 
         Parameters
@@ -80,6 +80,10 @@ class NautilusBound:
             Pool used for parallel processing. Default is None.
         rng : None or numpy.random.Generator, optional
             Determines random number generation. Default is None.
+        warm_start : NautilusBound or None, optional
+            Previous bound; its last networks initialize JAX training of the
+            first networks here, each later set starting from the one before.
+            Default is None.
 
         Returns
         -------
@@ -111,13 +115,19 @@ class NautilusBound:
         if neural_network_kwargs is None:
             neural_network_kwargs = {}
 
+        # Each network set starts from the one trained before it: the last
+        # set of the previous bound (warm_start), then the previous piece.
+        previous = None
+        if isinstance(warm_start, NautilusBound) and warm_start.neural_bounds:
+            previous = getattr(warm_start.neural_bounds[-1], 'emulator', None)
         for ellipsoid in multi_ellipsoid.bounds:
             select = ellipsoid.contains(points)
             bound.neural_bounds.append(NeuralBound.compute(
                 points[select], log_l[select], log_l_min,
                 enlarge_per_dim=enlarge_per_dim, n_networks=n_networks,
                 neural_network_kwargs=neural_network_kwargs, pool=pool,
-                rng=rng, backend=bound.backend))
+                rng=rng, backend=bound.backend, warm_start=previous))
+            previous = getattr(bound.neural_bounds[-1], 'emulator', previous)
 
         bound.outer_bound = Union.compute(
             points[log_l >= log_l_min], enlarge_per_dim=enlarge_per_dim,
